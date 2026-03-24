@@ -1,6 +1,7 @@
 """
 Web Unzip Pro - Multi-User Edition
 Supports concurrent users with isolated workspaces, Redis caching, rate limiting
+Fixed for Render deployment - using /tmp directory for writable storage
 """
 
 import os
@@ -56,18 +57,27 @@ try:
 except ImportError:
     HAS_RAR = False
 
+
 # ==================== Configuration ====================
 class Config:
     # Server config
     MAX_CONTENT_LENGTH = 1024 * 1024 * 1024  # 1GB
     SECRET_KEY = os.environ.get('SECRET_KEY', os.urandom(24).hex())
-    SESSION_TYPE = 'filesystem'  # Or 'redis'
+    SESSION_TYPE = 'filesystem'
     
-    # Directories
-    DATA_DIR = '/app/data' if os.environ.get('RENDER') else './data'
-    UPLOAD_DIR = os.path.join(DATA_DIR, 'uploads')
-    EXTRACT_DIR = os.path.join(DATA_DIR, 'extracts')
-    TEMP_DIR = os.path.join(DATA_DIR, 'temp')
+    # ============ FIX PERMISSION ERROR ============
+    # Render chỉ cho phép ghi trong /tmp hoặc thư mục hiện tại
+    if os.environ.get('RENDER'):
+        # Trên Render: dùng /tmp (có quyền ghi)
+        BASE_DIR = '/tmp/unzip_app'
+    else:
+        # Local development: dùng thư mục hiện tại
+        BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+    
+    UPLOAD_DIR = os.path.join(BASE_DIR, 'uploads')
+    EXTRACT_DIR = os.path.join(BASE_DIR, 'extracts')
+    TEMP_DIR = os.path.join(BASE_DIR, 'temp')
+    # =============================================
     
     # Performance
     MAX_WORKSPACE_SIZE = 1024 * 1024 * 1024  # 1GB per user
@@ -90,10 +100,29 @@ class Config:
     # Allowed extensions
     ALLOWED_EXTENSIONS = {'zip', 'rar', '7z', 'tar', 'gz', 'bz2', 'tgz', 'tbz2'}
 
-# Create directories
-os.makedirs(Config.UPLOAD_DIR, exist_ok=True)
-os.makedirs(Config.EXTRACT_DIR, exist_ok=True)
-os.makedirs(Config.TEMP_DIR, exist_ok=True)
+
+# ============ CREATE DIRECTORIES WITH ERROR HANDLING ============
+try:
+    os.makedirs(Config.UPLOAD_DIR, exist_ok=True)
+    os.makedirs(Config.EXTRACT_DIR, exist_ok=True)
+    os.makedirs(Config.TEMP_DIR, exist_ok=True)
+    print(f"✅ Directories created successfully")
+    print(f"   BASE_DIR: {Config.BASE_DIR}")
+    print(f"   UPLOAD_DIR: {Config.UPLOAD_DIR}")
+    print(f"   EXTRACT_DIR: {Config.EXTRACT_DIR}")
+except Exception as e:
+    print(f"❌ Error creating directories: {e}")
+    # Fallback to tempfile if permission denied
+    import tempfile
+    Config.BASE_DIR = tempfile.gettempdir() + '/unzip_app'
+    Config.UPLOAD_DIR = os.path.join(Config.BASE_DIR, 'uploads')
+    Config.EXTRACT_DIR = os.path.join(Config.BASE_DIR, 'extracts')
+    Config.TEMP_DIR = os.path.join(Config.BASE_DIR, 'temp')
+    os.makedirs(Config.UPLOAD_DIR, exist_ok=True)
+    os.makedirs(Config.EXTRACT_DIR, exist_ok=True)
+    os.makedirs(Config.TEMP_DIR, exist_ok=True)
+    print(f"   Fallback to: {Config.BASE_DIR}")
+
 
 # Initialize Flask app
 app = Flask(__name__)
@@ -129,6 +158,7 @@ if HAS_CELERY:
         task_time_limit=Config.EXTRACT_TIMEOUT,
         task_soft_time_limit=Config.EXTRACT_TIMEOUT - 10,
     )
+
 
 # ==================== Workspace Manager ====================
 
@@ -169,7 +199,6 @@ class WorkspaceManager:
             workspace = self._workspaces.get(workspace_id)
             if workspace:
                 workspace['last_access'] = time.time()
-                # Also check Redis for cross-instance access if available
                 if redis_client:
                     redis_client.hset(f"workspace:{workspace_id}", mapping={
                         'last_access': workspace['last_access'],
@@ -186,7 +215,6 @@ class WorkspaceManager:
                 workspace['total_size'] = total_size
                 workspace['last_access'] = time.time()
                 
-                # Update Redis for cross-instance
                 if redis_client:
                     redis_client.hset(f"workspace:{workspace_id}", mapping={
                         'total_size': total_size,
@@ -195,34 +223,29 @@ class WorkspaceManager:
                     redis_client.setex(f"workspace_files:{workspace_id}", Config.WORKSPACE_EXPIRY, json.dumps(files))
     
     def increment_active(self, workspace_id: str):
-        """Increment active extraction count"""
         with self._lock:
             workspace = self._workspaces.get(workspace_id)
             if workspace:
                 workspace['active_extractions'] += 1
     
     def decrement_active(self, workspace_id: str):
-        """Decrement active extraction count"""
         with self._lock:
             workspace = self._workspaces.get(workspace_id)
             if workspace:
                 workspace['active_extractions'] = max(0, workspace['active_extractions'] - 1)
     
     def delete_workspace(self, workspace_id: str):
-        """Delete workspace and all extracted files"""
         with self._lock:
             workspace = self._workspaces.pop(workspace_id, None)
         
         if workspace and os.path.exists(workspace['path']):
             shutil.rmtree(workspace['path'], ignore_errors=True)
         
-        # Clean up Redis
         if redis_client:
             redis_client.delete(f"workspace:{workspace_id}")
             redis_client.delete(f"workspace_files:{workspace_id}")
     
     def _cleanup_loop(self):
-        """Background thread to clean up expired workspaces"""
         while True:
             time.sleep(Config.CLEANUP_INTERVAL)
             now = time.time()
@@ -238,122 +261,116 @@ class WorkspaceManager:
                 logger.info(f"Cleaning up expired workspace: {wid}")
                 self.delete_workspace(wid)
 
-# Global workspace manager
+
 workspace_manager = WorkspaceManager()
 
-# ==================== Rate Limit Key Functions ====================
+
+# ==================== Helper Functions ====================
 
 def get_session_id():
-    """Get or create session ID for rate limiting"""
     if 'session_id' not in session:
         session['session_id'] = str(uuid.uuid4())
     return session['session_id']
 
+
 def get_user_workspace():
-    """Get or create workspace for current user"""
     session_id = get_session_id()
     
-    # Check if user already has a workspace in this session
     if 'workspace_id' in session:
         workspace = workspace_manager.get_workspace(session['workspace_id'])
         if workspace:
             return workspace
     
-    # Create new workspace
     workspace = workspace_manager.create_workspace(session_id)
     session['workspace_id'] = workspace['id']
     return workspace
 
+
+def format_size(size_bytes: int) -> str:
+    for unit in ['B', 'KB', 'MB', 'GB']:
+        if size_bytes < 1024.0:
+            return f"{size_bytes:.1f} {unit}"
+        size_bytes /= 1024.0
+    return f"{size_bytes:.1f} TB"
+
+
+def allowed_file(filename: str) -> bool:
+    return '.' in filename and filename.rsplit('.', 1)[1].lower() in Config.ALLOWED_EXTENSIONS
+
+
 # ==================== Extraction Handlers ====================
 
 def extract_zip(filepath, extract_to):
-    """Extract ZIP file"""
     files = []
-    try:
-        with zipfile.ZipFile(filepath, 'r') as zf:
-            for member in zf.namelist():
-                if member.endswith('/'):
-                    continue
-                extracted_path = zf.extract(member, extract_to)
-                files.append({
-                    'name': member,
-                    'path': extracted_path,
-                    'size': os.path.getsize(extracted_path)
-                })
-        return files
-    except Exception as e:
-        logger.error(f"ZIP extraction error: {e}")
-        raise
+    with zipfile.ZipFile(filepath, 'r') as zf:
+        for member in zf.namelist():
+            if member.endswith('/'):
+                continue
+            extracted_path = zf.extract(member, extract_to)
+            files.append({
+                'name': member,
+                'path': extracted_path,
+                'size': os.path.getsize(extracted_path)
+            })
+    return files
+
 
 def extract_tar(filepath, extract_to):
-    """Extract TAR/GZ/BZ2 file"""
     files = []
-    try:
-        mode = 'r:gz' if filepath.endswith(('.gz', '.tgz')) else \
-               'r:bz2' if filepath.endswith(('.bz2', '.tbz2')) else 'r'
-        
-        with tarfile.open(filepath, mode) as tf:
-            for member in tf.getmembers():
-                if member.isfile():
-                    tf.extract(member, extract_to)
-                    extracted_path = os.path.join(extract_to, member.name)
-                    files.append({
-                        'name': member.name,
-                        'path': extracted_path,
-                        'size': member.size
-                    })
-        return files
-    except Exception as e:
-        logger.error(f"TAR extraction error: {e}")
-        raise
+    mode = 'r:gz' if filepath.endswith(('.gz', '.tgz')) else \
+           'r:bz2' if filepath.endswith(('.bz2', '.tbz2')) else 'r'
+    
+    with tarfile.open(filepath, mode) as tf:
+        for member in tf.getmembers():
+            if member.isfile():
+                tf.extract(member, extract_to)
+                extracted_path = os.path.join(extract_to, member.name)
+                files.append({
+                    'name': member.name,
+                    'path': extracted_path,
+                    'size': member.size
+                })
+    return files
+
 
 def extract_7z(filepath, extract_to):
-    """Extract 7Z file"""
     if not HAS_7Z:
-        raise Exception("7Z support not installed")
+        raise Exception("7Z support not installed. Run: pip install py7zr")
     
     files = []
-    try:
-        with py7zr.SevenZipFile(filepath, 'r') as szf:
-            szf.extractall(extract_to)
-            for root, _, filenames in os.walk(extract_to):
-                for filename in filenames:
-                    full_path = os.path.join(root, filename)
-                    rel_path = os.path.relpath(full_path, extract_to)
-                    files.append({
-                        'name': rel_path,
-                        'path': full_path,
-                        'size': os.path.getsize(full_path)
-                    })
-        return files
-    except Exception as e:
-        logger.error(f"7Z extraction error: {e}")
-        raise
+    with py7zr.SevenZipFile(filepath, 'r') as szf:
+        szf.extractall(extract_to)
+        for root, _, filenames in os.walk(extract_to):
+            for filename in filenames:
+                full_path = os.path.join(root, filename)
+                rel_path = os.path.relpath(full_path, extract_to)
+                files.append({
+                    'name': rel_path,
+                    'path': full_path,
+                    'size': os.path.getsize(full_path)
+                })
+    return files
+
 
 def extract_rar(filepath, extract_to):
-    """Extract RAR file"""
     if not HAS_RAR:
-        raise Exception("RAR support not installed")
+        raise Exception("RAR support not installed. Run: pip install rarfile")
     
     files = []
-    try:
-        with rarfile.RarFile(filepath) as rf:
-            for member in rf.infolist():
-                if not member.isdir():
-                    rf.extract(member, extract_to)
-                    extracted_path = os.path.join(extract_to, member.filename)
-                    files.append({
-                        'name': member.filename,
-                        'path': extracted_path,
-                        'size': member.file_size
-                    })
-        return files
-    except Exception as e:
-        logger.error(f"RAR extraction error: {e}")
-        raise
+    with rarfile.RarFile(filepath) as rf:
+        for member in rf.infolist():
+            if not member.isdir():
+                rf.extract(member, extract_to)
+                extracted_path = os.path.join(extract_to, member.filename)
+                files.append({
+                    'name': member.filename,
+                    'path': extracted_path,
+                    'size': member.file_size
+                })
+    return files
+
 
 def get_extraction_handler(filepath: str):
-    """Get appropriate extraction handler based on file extension"""
     ext = filepath.split('.')[-1].lower()
     
     handlers = {
@@ -374,32 +391,25 @@ def get_extraction_handler(filepath: str):
     else:
         raise ValueError(f"Unsupported file type: {ext}")
 
-# ==================== Celery Task (Async Extraction) ====================
+
+# ==================== Celery Task ====================
 
 if celery:
     @celery.task(bind=True, name='extract_archive')
     def extract_archive_task(self, file_path: str, workspace_id: str, original_filename: str):
-        """Background task for extracting archives"""
         try:
-            # Get file extension
-            ext = file_path.split('.')[-1].lower()
             workspace = workspace_manager.get_workspace(workspace_id)
-            
             if not workspace:
                 return {'error': 'Workspace not found'}
             
             workspace_manager.increment_active(workspace_id)
-            
-            # Update task progress
             self.update_state(state='PROGRESS', meta={'progress': 10, 'message': 'Starting extraction...'})
             
-            # Get handler and extract
             handler = get_extraction_handler(file_path)
             extracted_files = handler(file_path, workspace['path'])
             
             self.update_state(state='PROGRESS', meta={'progress': 90, 'message': 'Processing files...'})
             
-            # Prepare response
             file_list = []
             total_size = 0
             for f in extracted_files:
@@ -410,10 +420,8 @@ if celery:
                     'size_formatted': format_size(f['size'])
                 })
             
-            # Update workspace
             workspace_manager.update_workspace_files(workspace_id, file_list, total_size)
             
-            # Clean up uploaded file
             if os.path.exists(file_path):
                 os.remove(file_path)
             
@@ -432,34 +440,25 @@ if celery:
             workspace_manager.decrement_active(workspace_id)
             return {'error': str(e)}
 
-# ==================== Helper Functions ====================
-
-def format_size(size_bytes: int) -> str:
-    """Format file size human readable"""
-    for unit in ['B', 'KB', 'MB', 'GB']:
-        if size_bytes < 1024.0:
-            return f"{size_bytes:.1f} {unit}"
-        size_bytes /= 1024.0
-    return f"{size_bytes:.1f} TB"
-
-def allowed_file(filename: str) -> bool:
-    """Check if file extension is allowed"""
-    return '.' in filename and filename.rsplit('.', 1)[1].lower() in Config.ALLOWED_EXTENSIONS
 
 # ==================== API Endpoints ====================
 
 @app.route('/')
 @limiter.exempt
 def index():
-    """Main page"""
     return render_template_string(HTML_TEMPLATE_MULTI)
+
+
+@app.route('/health')
+def health():
+    """Health check endpoint for Render"""
+    return jsonify({'status': 'healthy', 'base_dir': Config.BASE_DIR})
+
 
 @app.route('/api/upload', methods=['POST'])
 @limiter.limit(Config.RATE_LIMIT)
 def upload_file():
-    """Upload and extract archive (sync or async)"""
     try:
-        # Check file
         if 'file' not in request.files:
             return jsonify({'error': 'No file uploaded'}), 400
         
@@ -470,19 +469,14 @@ def upload_file():
         if not allowed_file(file.filename):
             return jsonify({'error': f'File type not allowed. Allowed: {", ".join(Config.ALLOWED_EXTENSIONS)}'}), 400
         
-        # Get or create workspace for this user
         workspace = get_user_workspace()
         
-        # Check workspace size limit
         if workspace['total_size'] > Config.MAX_WORKSPACE_SIZE:
-            return jsonify({'error': 'Workspace size limit exceeded. Please clear old files.'}), 413
+            return jsonify({'error': 'Workspace size limit exceeded'}), 413
         
-        # Check concurrent extraction limit
         if workspace['active_extractions'] >= Config.MAX_CONCURRENT_EXTRACTIONS:
-            return jsonify({'error': f'Too many concurrent extractions (max {Config.MAX_CONCURRENT_EXTRACTIONS}). Please wait.'}), 429
+            return jsonify({'error': f'Too many concurrent extractions (max {Config.MAX_CONCURRENT_EXTRACTIONS})'}), 429
         
-        # Save uploaded file
-        ext = file.filename.rsplit('.', 1)[1].lower()
         upload_id = hashlib.md5(f"{time.time()}{file.filename}".encode()).hexdigest()[:16]
         temp_path = os.path.join(Config.UPLOAD_DIR, f"{upload_id}_{secure_filename(file.filename)}")
         file.save(temp_path)
@@ -490,7 +484,6 @@ def upload_file():
         
         logger.info(f"User {session.get('session_id')} uploaded: {file.filename} ({format_size(file_size)})")
         
-        # Use Celery for async if available
         if celery and request.args.get('async') == 'true':
             task = extract_archive_task.delay(temp_path, workspace['id'], file.filename)
             return jsonify({
@@ -500,7 +493,6 @@ def upload_file():
                 'extract_id': workspace['id']
             })
         
-        # Sync extraction (fallback)
         try:
             start_time = time.time()
             handler = get_extraction_handler(temp_path)
@@ -517,10 +509,7 @@ def upload_file():
                     'size_formatted': format_size(f['size'])
                 })
             
-            # Update workspace
             workspace_manager.update_workspace_files(workspace['id'], file_list, total_size)
-            
-            # Clean up uploaded file
             os.remove(temp_path)
             
             return jsonify({
@@ -546,30 +535,9 @@ def upload_file():
         logger.error(f"Upload error: {traceback.format_exc()}")
         return jsonify({'error': str(e)}), 500
 
-@app.route('/api/task/<task_id>')
-def get_task_status(task_id):
-    """Get status of async extraction task"""
-    if not celery:
-        return jsonify({'error': 'Async tasks not enabled'}), 400
-    
-    task = extract_archive_task.AsyncResult(task_id)
-    
-    if task.state == 'PENDING':
-        response = {'state': 'PENDING', 'progress': 0}
-    elif task.state == 'PROGRESS':
-        response = {'state': 'PROGRESS', **task.info}
-    elif task.state == 'SUCCESS':
-        response = {'state': 'SUCCESS', 'result': task.result}
-    elif task.state == 'FAILURE':
-        response = {'state': 'FAILURE', 'error': str(task.info)}
-    else:
-        response = {'state': task.state}
-    
-    return jsonify(response)
 
 @app.route('/api/workspace')
-def get_workspace():
-    """Get current workspace info"""
+def get_workspace_api():
     workspace = get_user_workspace()
     return jsonify({
         'success': True,
@@ -580,13 +548,12 @@ def get_workspace():
         'files': workspace['files']
     })
 
+
 @app.route('/api/download/<filename>')
-def download_file(filename):
-    """Download extracted file from user's workspace"""
+def download_file_api(filename):
     workspace = get_user_workspace()
     file_path = os.path.join(workspace['path'], filename)
     
-    # Security: ensure file is within workspace
     real_path = os.path.realpath(file_path)
     if not real_path.startswith(os.path.realpath(workspace['path'])):
         return jsonify({'error': 'Invalid file path'}), 403
@@ -600,9 +567,9 @@ def download_file(filename):
         download_name=os.path.basename(filename)
     )
 
+
 @app.route('/api/download-all')
 def download_all():
-    """Download all files as ZIP"""
     workspace = get_user_workspace()
     
     memory_file = io.BytesIO()
@@ -622,17 +589,17 @@ def download_all():
         mimetype='application/zip'
     )
 
+
 @app.route('/api/delete', methods=['DELETE'])
-def delete_workspace():
-    """Delete current user's workspace"""
+def delete_workspace_api():
     workspace = get_user_workspace()
     workspace_manager.delete_workspace(workspace['id'])
     session.pop('workspace_id', None)
     return jsonify({'success': True})
 
+
 @app.route('/api/delete-file/<filename>', methods=['DELETE'])
-def delete_file(filename):
-    """Delete a single file from workspace"""
+def delete_file_api(filename):
     workspace = get_user_workspace()
     file_path = os.path.join(workspace['path'], filename)
     
@@ -642,20 +609,12 @@ def delete_file(filename):
     
     if os.path.exists(real_path):
         os.remove(real_path)
-        
-        # Update workspace files list
         new_files = [f for f in workspace['files'] if f['name'] != filename]
         new_size = sum(f['size'] for f in new_files)
         workspace_manager.update_workspace_files(workspace['id'], new_files, new_size)
     
     return jsonify({'success': True})
 
-@app.route('/api/cleanup', methods=['POST'])
-@limiter.limit("5 per minute")
-def force_cleanup():
-    """Force cleanup of expired workspaces"""
-    # This will be handled by background thread, just trigger
-    return jsonify({'success': True, 'message': 'Cleanup will run in background'})
 
 # ==================== HTML Template ====================
 
@@ -681,7 +640,6 @@ HTML_TEMPLATE_MULTI = '''
         .toast-notification { position: fixed; bottom: 20px; right: 20px; z-index: 9999; }
         .fade-in { animation: fadeIn 0.3s ease; }
         @keyframes fadeIn { from { opacity: 0; transform: translateY(20px); } to { opacity: 1; transform: translateY(0); } }
-        .badge-multi { background: #06ffa5; color: #1e1e2f; }
         .session-id { font-size: 11px; font-family: monospace; background: rgba(255,255,255,0.2); padding: 4px 8px; border-radius: 20px; }
     </style>
 </head>
@@ -858,7 +816,6 @@ HTML_TEMPLATE_MULTI = '''
         
         document.getElementById('searchInput').addEventListener('input', renderFileList);
         
-        // Drag & Drop
         const uploadArea = document.getElementById('uploadArea');
         const fileInput = document.getElementById('fileInput');
         
@@ -868,7 +825,6 @@ HTML_TEMPLATE_MULTI = '''
         uploadArea.addEventListener('click', () => fileInput.click());
         fileInput.addEventListener('change', e => { if (e.target.files[0]) uploadFile(e.target.files[0]); fileInput.value = ''; });
         
-        // Initialize
         getWorkspace();
         showToast('🚀 Web Unzip Pro Multi-User sẵn sàng | Mỗi người dùng có workspace riêng', 'success');
     </script>
