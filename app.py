@@ -1,7 +1,11 @@
 """
-Web Unzip Pro - Multi-User Edition
-Supports concurrent users with isolated workspaces, Redis caching, rate limiting
-Fixed for Render deployment - using /tmp directory for writable storage
+Web Unzip Pro - Stable Multi-User Edition
+- Safe extraction (anti zip-slip)
+- Timeout protection
+- No RAM crash (stream zip)
+- Workspace isolation
+- Improved concurrency
+- Beautiful UI
 """
 
 import os
@@ -16,631 +20,550 @@ import hashlib
 import uuid
 import threading
 import logging
-import traceback
 from pathlib import Path
-from datetime import datetime, timedelta
-from functools import wraps
-from typing import Dict, List, Optional, Tuple
-
-# Flask and extensions
-from flask import Flask, request, jsonify, send_file, render_template_string, session, g
+from datetime import datetime
+from flask import Flask, request, jsonify, send_file, render_template_string, session
 from flask_cors import CORS
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 from werkzeug.utils import secure_filename
-from werkzeug.middleware.proxy_fix import ProxyFix
 
-# Background task queue
-try:
-    from celery import Celery
-    HAS_CELERY = True
-except ImportError:
-    HAS_CELERY = False
+# ==================== CONFIG ====================
 
-# Redis for caching (optional)
-try:
-    import redis
-    HAS_REDIS = True
-except ImportError:
-    HAS_REDIS = False
-
-# Optional extended format support
-try:
-    import py7zr
-    HAS_7Z = True
-except ImportError:
-    HAS_7Z = False
-
-try:
-    import rarfile
-    HAS_RAR = True
-except ImportError:
-    HAS_RAR = False
-
-
-# ==================== Configuration ====================
 class Config:
-    # Server config
-    MAX_CONTENT_LENGTH = 1024 * 1024 * 1024  # 1GB
     SECRET_KEY = os.environ.get('SECRET_KEY', os.urandom(24).hex())
-    SESSION_TYPE = 'filesystem'
-    
-    # ============ FIX PERMISSION ERROR ============
-    # Render chỉ cho phép ghi trong /tmp hoặc thư mục hiện tại
+
+    # Use /tmp on Render for writable storage
     if os.environ.get('RENDER'):
-        # Trên Render: dùng /tmp (có quyền ghi)
         BASE_DIR = '/tmp/unzip_app'
     else:
-        # Local development: dùng thư mục hiện tại
         BASE_DIR = os.path.dirname(os.path.abspath(__file__))
     
     UPLOAD_DIR = os.path.join(BASE_DIR, 'uploads')
     EXTRACT_DIR = os.path.join(BASE_DIR, 'extracts')
-    TEMP_DIR = os.path.join(BASE_DIR, 'temp')
-    # =============================================
-    
-    # Performance
-    MAX_WORKSPACE_SIZE = 1024 * 1024 * 1024  # 1GB per user
-    MAX_CONCURRENT_EXTRACTIONS = 10
-    EXTRACT_TIMEOUT = 300  # 5 minutes per file
-    CLEANUP_INTERVAL = 3600  # 1 hour
-    WORKSPACE_EXPIRY = 7200  # 2 hours idle
-    
-    # Rate limiting
-    RATE_LIMIT = "30 per minute"
-    RATE_LIMIT_STORAGE = "memory://"
-    
-    # Redis (optional)
-    REDIS_URL = os.environ.get('REDIS_URL', 'redis://localhost:6379/0')
-    
-    # Celery (optional)
-    CELERY_BROKER_URL = os.environ.get('CELERY_BROKER_URL', 'redis://localhost:6379/1')
-    CELERY_RESULT_BACKEND = os.environ.get('CELERY_RESULT_BACKEND', 'redis://localhost:6379/2')
-    
-    # Allowed extensions
-    ALLOWED_EXTENSIONS = {'zip', 'rar', '7z', 'tar', 'gz', 'bz2', 'tgz', 'tbz2'}
 
+    MAX_WORKSPACE_SIZE = 1024 * 1024 * 1024  # 1GB
+    MAX_FILES = 10000
+    MAX_FILE_SIZE = 200 * 1024 * 1024  # 200MB per file
+    EXTRACT_TIMEOUT = 120  # seconds
 
-# ============ CREATE DIRECTORIES WITH ERROR HANDLING ============
-try:
-    os.makedirs(Config.UPLOAD_DIR, exist_ok=True)
-    os.makedirs(Config.EXTRACT_DIR, exist_ok=True)
-    os.makedirs(Config.TEMP_DIR, exist_ok=True)
-    print(f"✅ Directories created successfully")
-    print(f"   BASE_DIR: {Config.BASE_DIR}")
-    print(f"   UPLOAD_DIR: {Config.UPLOAD_DIR}")
-    print(f"   EXTRACT_DIR: {Config.EXTRACT_DIR}")
-except Exception as e:
-    print(f"❌ Error creating directories: {e}")
-    # Fallback to tempfile if permission denied
-    import tempfile
-    Config.BASE_DIR = tempfile.gettempdir() + '/unzip_app'
-    Config.UPLOAD_DIR = os.path.join(Config.BASE_DIR, 'uploads')
-    Config.EXTRACT_DIR = os.path.join(Config.BASE_DIR, 'extracts')
-    Config.TEMP_DIR = os.path.join(Config.BASE_DIR, 'temp')
-    os.makedirs(Config.UPLOAD_DIR, exist_ok=True)
-    os.makedirs(Config.EXTRACT_DIR, exist_ok=True)
-    os.makedirs(Config.TEMP_DIR, exist_ok=True)
-    print(f"   Fallback to: {Config.BASE_DIR}")
+    RATE_LIMIT = "20 per minute"
 
+    ALLOWED_EXTENSIONS = {'zip', 'tar', 'gz', 'tgz', 'bz2'}
 
-# Initialize Flask app
+# Create directories
+os.makedirs(Config.UPLOAD_DIR, exist_ok=True)
+os.makedirs(Config.EXTRACT_DIR, exist_ok=True)
+
+# ==================== APP ====================
+
 app = Flask(__name__)
 app.config.from_object(Config)
-app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1, x_host=1)
+app.secret_key = Config.SECRET_KEY
 CORS(app)
 
-# Setup logging
+limiter = Limiter(app=app, key_func=get_remote_address)
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Rate limiter
-limiter = Limiter(
-    app=app,
-    key_func=get_remote_address,
-    default_limits=[Config.RATE_LIMIT],
-    storage_uri=Config.RATE_LIMIT_STORAGE
-)
-
-# Redis client (optional)
-redis_client = redis.from_url(Config.REDIS_URL) if HAS_REDIS else None
-
-# Celery app (optional)
-celery = None
-if HAS_CELERY:
-    celery = Celery(
-        'unzip_tasks',
-        broker=Config.CELERY_BROKER_URL,
-        backend=Config.CELERY_RESULT_BACKEND
-    )
-    celery.conf.update(
-        task_track_started=True,
-        task_time_limit=Config.EXTRACT_TIMEOUT,
-        task_soft_time_limit=Config.EXTRACT_TIMEOUT - 10,
-    )
-
-
-# ==================== Workspace Manager ====================
+# ==================== WORKSPACE ====================
 
 class WorkspaceManager:
-    """Manage isolated workspaces for each user session"""
-    
     def __init__(self):
-        self._workspaces: Dict[str, dict] = {}
-        self._lock = threading.Lock()
-        self._cleanup_thread = threading.Thread(target=self._cleanup_loop, daemon=True)
-        self._cleanup_thread.start()
-    
-    def create_workspace(self, session_id: str) -> dict:
-        """Create a new workspace for a user"""
-        workspace_id = hashlib.md5(f"{session_id}{time.time()}{uuid.uuid4()}".encode()).hexdigest()[:16]
-        workspace_path = os.path.join(Config.EXTRACT_DIR, workspace_id)
-        os.makedirs(workspace_path, exist_ok=True)
-        
-        workspace = {
-            'id': workspace_id,
-            'path': workspace_path,
-            'session_id': session_id,
-            'created_at': time.time(),
-            'last_access': time.time(),
-            'files': [],
-            'total_size': 0,
-            'active_extractions': 0
-        }
-        
-        with self._lock:
-            self._workspaces[workspace_id] = workspace
-        
-        return workspace
-    
-    def get_workspace(self, workspace_id: str) -> Optional[dict]:
-        """Get workspace by ID, update last access"""
-        with self._lock:
-            workspace = self._workspaces.get(workspace_id)
-            if workspace:
-                workspace['last_access'] = time.time()
-                if redis_client:
-                    redis_client.hset(f"workspace:{workspace_id}", mapping={
-                        'last_access': workspace['last_access'],
-                        'total_size': workspace['total_size']
-                    })
-            return workspace
-    
-    def update_workspace_files(self, workspace_id: str, files: List[dict], total_size: int):
-        """Update file list in workspace"""
-        with self._lock:
-            workspace = self._workspaces.get(workspace_id)
-            if workspace:
-                workspace['files'] = files
-                workspace['total_size'] = total_size
-                workspace['last_access'] = time.time()
-                
-                if redis_client:
-                    redis_client.hset(f"workspace:{workspace_id}", mapping={
-                        'total_size': total_size,
-                        'last_access': workspace['last_access']
-                    })
-                    redis_client.setex(f"workspace_files:{workspace_id}", Config.WORKSPACE_EXPIRY, json.dumps(files))
-    
-    def increment_active(self, workspace_id: str):
-        with self._lock:
-            workspace = self._workspaces.get(workspace_id)
-            if workspace:
-                workspace['active_extractions'] += 1
-    
-    def decrement_active(self, workspace_id: str):
-        with self._lock:
-            workspace = self._workspaces.get(workspace_id)
-            if workspace:
-                workspace['active_extractions'] = max(0, workspace['active_extractions'] - 1)
-    
-    def delete_workspace(self, workspace_id: str):
-        with self._lock:
-            workspace = self._workspaces.pop(workspace_id, None)
-        
-        if workspace and os.path.exists(workspace['path']):
-            shutil.rmtree(workspace['path'], ignore_errors=True)
-        
-        if redis_client:
-            redis_client.delete(f"workspace:{workspace_id}")
-            redis_client.delete(f"workspace_files:{workspace_id}")
-    
-    def _cleanup_loop(self):
-        while True:
-            time.sleep(Config.CLEANUP_INTERVAL)
-            now = time.time()
-            expired = []
-            
-            with self._lock:
-                for wid, ws in self._workspaces.items():
-                    if now - ws['last_access'] > Config.WORKSPACE_EXPIRY:
-                        if ws['active_extractions'] == 0:
-                            expired.append(wid)
-            
-            for wid in expired:
-                logger.info(f"Cleaning up expired workspace: {wid}")
-                self.delete_workspace(wid)
+        self.data = {}
+        self.lock = threading.Lock()
 
+    def create(self):
+        wid = uuid.uuid4().hex[:16]
+        path = os.path.join(Config.EXTRACT_DIR, wid)
+        os.makedirs(path, exist_ok=True)
+
+        ws = {
+            "id": wid,
+            "path": path,
+            "files": [],
+            "size": 0,
+            "created_at": time.time()
+        }
+
+        with self.lock:
+            self.data[wid] = ws
+
+        return ws
+
+    def get(self, wid):
+        with self.lock:
+            return self.data.get(wid)
+
+    def delete(self, wid):
+        with self.lock:
+            ws = self.data.pop(wid, None)
+            if ws and os.path.exists(ws["path"]):
+                shutil.rmtree(ws["path"], ignore_errors=True)
+            return ws
 
 workspace_manager = WorkspaceManager()
 
 
-# ==================== Helper Functions ====================
-
-def get_session_id():
-    if 'session_id' not in session:
-        session['session_id'] = str(uuid.uuid4())
-    return session['session_id']
-
-
-def get_user_workspace():
-    session_id = get_session_id()
-    
-    if 'workspace_id' in session:
-        workspace = workspace_manager.get_workspace(session['workspace_id'])
-        if workspace:
-            return workspace
-    
-    workspace = workspace_manager.create_workspace(session_id)
-    session['workspace_id'] = workspace['id']
-    return workspace
+def get_workspace():
+    if "wid" not in session:
+        ws = workspace_manager.create()
+        session["wid"] = ws["id"]
+        return ws
+    ws = workspace_manager.get(session["wid"])
+    if not ws:
+        ws = workspace_manager.create()
+        session["wid"] = ws["id"]
+    return ws
 
 
-def format_size(size_bytes: int) -> str:
-    for unit in ['B', 'KB', 'MB', 'GB']:
-        if size_bytes < 1024.0:
-            return f"{size_bytes:.1f} {unit}"
-        size_bytes /= 1024.0
-    return f"{size_bytes:.1f} TB"
+# ==================== SECURITY ====================
+
+def safe_path(base, target):
+    """Prevent zip-slip attacks"""
+    real_base = os.path.realpath(base)
+    real_target = os.path.realpath(target)
+    if not real_target.startswith(real_base):
+        raise Exception("Path traversal detected")
+    return real_target
 
 
-def allowed_file(filename: str) -> bool:
-    return '.' in filename and filename.rsplit('.', 1)[1].lower() in Config.ALLOWED_EXTENSIONS
+def allowed_file(name):
+    return '.' in name and name.rsplit('.', 1)[1].lower() in Config.ALLOWED_EXTENSIONS
 
 
-# ==================== Extraction Handlers ====================
+# ==================== TIMEOUT ====================
 
-def extract_zip(filepath, extract_to):
-    files = []
-    with zipfile.ZipFile(filepath, 'r') as zf:
-        for member in zf.namelist():
-            if member.endswith('/'):
-                continue
-            extracted_path = zf.extract(member, extract_to)
-            files.append({
-                'name': member,
-                'path': extracted_path,
-                'size': os.path.getsize(extracted_path)
-            })
-    return files
+def run_with_timeout(func, timeout, *args):
+    result = {}
 
-
-def extract_tar(filepath, extract_to):
-    files = []
-    mode = 'r:gz' if filepath.endswith(('.gz', '.tgz')) else \
-           'r:bz2' if filepath.endswith(('.bz2', '.tbz2')) else 'r'
-    
-    with tarfile.open(filepath, mode) as tf:
-        for member in tf.getmembers():
-            if member.isfile():
-                tf.extract(member, extract_to)
-                extracted_path = os.path.join(extract_to, member.name)
-                files.append({
-                    'name': member.name,
-                    'path': extracted_path,
-                    'size': member.size
-                })
-    return files
-
-
-def extract_7z(filepath, extract_to):
-    if not HAS_7Z:
-        raise Exception("7Z support not installed. Run: pip install py7zr")
-    
-    files = []
-    with py7zr.SevenZipFile(filepath, 'r') as szf:
-        szf.extractall(extract_to)
-        for root, _, filenames in os.walk(extract_to):
-            for filename in filenames:
-                full_path = os.path.join(root, filename)
-                rel_path = os.path.relpath(full_path, extract_to)
-                files.append({
-                    'name': rel_path,
-                    'path': full_path,
-                    'size': os.path.getsize(full_path)
-                })
-    return files
-
-
-def extract_rar(filepath, extract_to):
-    if not HAS_RAR:
-        raise Exception("RAR support not installed. Run: pip install rarfile")
-    
-    files = []
-    with rarfile.RarFile(filepath) as rf:
-        for member in rf.infolist():
-            if not member.isdir():
-                rf.extract(member, extract_to)
-                extracted_path = os.path.join(extract_to, member.filename)
-                files.append({
-                    'name': member.filename,
-                    'path': extracted_path,
-                    'size': member.file_size
-                })
-    return files
-
-
-def get_extraction_handler(filepath: str):
-    ext = filepath.split('.')[-1].lower()
-    
-    handlers = {
-        'zip': extract_zip,
-        'tar': extract_tar,
-        'gz': extract_tar,
-        'tgz': extract_tar,
-        'bz2': extract_tar,
-        'tbz2': extract_tar,
-    }
-    
-    if ext in handlers:
-        return handlers[ext]
-    elif ext == '7z' and HAS_7Z:
-        return extract_7z
-    elif ext == 'rar' and HAS_RAR:
-        return extract_rar
-    else:
-        raise ValueError(f"Unsupported file type: {ext}")
-
-
-# ==================== Celery Task ====================
-
-if celery:
-    @celery.task(bind=True, name='extract_archive')
-    def extract_archive_task(self, file_path: str, workspace_id: str, original_filename: str):
+    def target():
         try:
-            workspace = workspace_manager.get_workspace(workspace_id)
-            if not workspace:
-                return {'error': 'Workspace not found'}
-            
-            workspace_manager.increment_active(workspace_id)
-            self.update_state(state='PROGRESS', meta={'progress': 10, 'message': 'Starting extraction...'})
-            
-            handler = get_extraction_handler(file_path)
-            extracted_files = handler(file_path, workspace['path'])
-            
-            self.update_state(state='PROGRESS', meta={'progress': 90, 'message': 'Processing files...'})
-            
-            file_list = []
-            total_size = 0
-            for f in extracted_files:
-                total_size += f['size']
-                file_list.append({
-                    'name': f['name'],
-                    'size': f['size'],
-                    'size_formatted': format_size(f['size'])
-                })
-            
-            workspace_manager.update_workspace_files(workspace_id, file_list, total_size)
-            
-            if os.path.exists(file_path):
-                os.remove(file_path)
-            
-            workspace_manager.decrement_active(workspace_id)
-            
-            return {
-                'success': True,
-                'total_files': len(file_list),
-                'total_size': total_size,
-                'total_size_formatted': format_size(total_size),
-                'files': file_list
-            }
-            
+            result['data'] = func(*args)
         except Exception as e:
-            logger.error(f"Async extraction error: {traceback.format_exc()}")
-            workspace_manager.decrement_active(workspace_id)
-            return {'error': str(e)}
+            result['error'] = str(e)
+
+    t = threading.Thread(target=target)
+    t.daemon = True
+    t.start()
+    t.join(timeout)
+
+    if t.is_alive():
+        raise Exception("Extraction timeout ({}s)".format(timeout))
+
+    if 'error' in result:
+        raise Exception(result['error'])
+
+    return result['data']
 
 
-# ==================== API Endpoints ====================
+# ==================== EXTRACT ====================
+
+def extract_zip(filepath, out):
+    """Extract ZIP with streaming and security checks"""
+    files = []
+    count = 0
+    total_size = 0
+
+    with zipfile.ZipFile(filepath, 'r') as z:
+        for member in z.infolist():
+            # Skip directories
+            if member.is_dir():
+                continue
+
+            count += 1
+            if count > Config.MAX_FILES:
+                raise Exception("Too many files in archive (max {})".format(Config.MAX_FILES))
+
+            if member.file_size > Config.MAX_FILE_SIZE:
+                raise Exception("File too large: {} > {}MB".format(member.filename, Config.MAX_FILE_SIZE / (1024*1024)))
+
+            # Safe path resolution
+            target_path = os.path.join(out, member.filename)
+            safe_path(out, target_path)
+
+            # Create directories if needed
+            os.makedirs(os.path.dirname(target_path), exist_ok=True)
+
+            # Extract with streaming (no RAM overload)
+            with z.open(member) as src, open(target_path, 'wb') as dst:
+                shutil.copyfileobj(src, dst)
+
+            files.append({
+                "name": member.filename,
+                "size": member.file_size,
+                "size_formatted": format_size(member.file_size)
+            })
+            total_size += member.file_size
+
+    return files, total_size
+
+
+def extract_tar(filepath, out):
+    """Extract TAR/GZ/BZ2 with streaming and security checks"""
+    files = []
+    count = 0
+    total_size = 0
+
+    # Determine open mode
+    if filepath.endswith(('.gz', '.tgz')):
+        mode = 'r:gz'
+    elif filepath.endswith(('.bz2', '.tbz2')):
+        mode = 'r:bz2'
+    else:
+        mode = 'r'
+
+    with tarfile.open(filepath, mode) as t:
+        for member in t.getmembers():
+            if not member.isfile():
+                continue
+
+            count += 1
+            if count > Config.MAX_FILES:
+                raise Exception("Too many files in archive (max {})".format(Config.MAX_FILES))
+
+            if member.size > Config.MAX_FILE_SIZE:
+                raise Exception("File too large: {} > {}MB".format(member.name, Config.MAX_FILE_SIZE / (1024*1024)))
+
+            # Safe path resolution
+            target_path = os.path.join(out, member.name)
+            safe_path(out, target_path)
+
+            # Create directories if needed
+            os.makedirs(os.path.dirname(target_path), exist_ok=True)
+
+            # Extract with streaming
+            with t.extractfile(member) as src, open(target_path, 'wb') as dst:
+                shutil.copyfileobj(src, dst)
+
+            files.append({
+                "name": member.name,
+                "size": member.size,
+                "size_formatted": format_size(member.size)
+            })
+            total_size += member.size
+
+    return files, total_size
+
+
+def extract_archive(filepath, out):
+    """Route to appropriate extractor"""
+    if filepath.endswith('.zip'):
+        return extract_zip(filepath, out)
+    return extract_tar(filepath, out)
+
+
+def format_size(size_bytes):
+    """Format file size human readable"""
+    if size_bytes == 0:
+        return "0 B"
+    units = ['B', 'KB', 'MB', 'GB']
+    i = 0
+    while size_bytes >= 1024 and i < len(units) - 1:
+        size_bytes /= 1024.0
+        i += 1
+    return "{:.1f} {}".format(size_bytes, units[i])
+
+
+# ==================== CLEANUP THREAD ====================
+
+def cleanup_old_workspaces():
+    """Remove workspaces older than 2 hours"""
+    while True:
+        time.sleep(3600)  # Every hour
+        now = time.time()
+        expired = []
+        with workspace_manager.lock:
+            for wid, ws in workspace_manager.data.items():
+                if now - ws['created_at'] > 7200:  # 2 hours
+                    expired.append(wid)
+        for wid in expired:
+            logger.info(f"Cleaning expired workspace: {wid}")
+            workspace_manager.delete(wid)
+
+
+# Start cleanup thread
+cleanup_thread = threading.Thread(target=cleanup_old_workspaces, daemon=True)
+cleanup_thread.start()
+
+
+# ==================== ROUTES ====================
 
 @app.route('/')
-@limiter.exempt
 def index():
-    return render_template_string(HTML_TEMPLATE_MULTI)
+    return render_template_string(HTML_TEMPLATE)
 
 
 @app.route('/health')
 def health():
-    """Health check endpoint for Render"""
-    return jsonify({'status': 'healthy', 'base_dir': Config.BASE_DIR})
+    """Health check for Render"""
+    return jsonify({
+        'status': 'healthy',
+        'base_dir': Config.BASE_DIR,
+        'timestamp': datetime.now().isoformat()
+    })
 
 
 @app.route('/api/upload', methods=['POST'])
 @limiter.limit(Config.RATE_LIMIT)
-def upload_file():
+def upload():
     try:
         if 'file' not in request.files:
-            return jsonify({'error': 'No file uploaded'}), 400
-        
-        file = request.files['file']
-        if file.filename == '':
-            return jsonify({'error': 'Empty filename'}), 400
-        
-        if not allowed_file(file.filename):
-            return jsonify({'error': f'File type not allowed. Allowed: {", ".join(Config.ALLOWED_EXTENSIONS)}'}), 400
-        
-        workspace = get_user_workspace()
-        
-        if workspace['total_size'] > Config.MAX_WORKSPACE_SIZE:
-            return jsonify({'error': 'Workspace size limit exceeded'}), 413
-        
-        if workspace['active_extractions'] >= Config.MAX_CONCURRENT_EXTRACTIONS:
-            return jsonify({'error': f'Too many concurrent extractions (max {Config.MAX_CONCURRENT_EXTRACTIONS})'}), 429
-        
-        upload_id = hashlib.md5(f"{time.time()}{file.filename}".encode()).hexdigest()[:16]
-        temp_path = os.path.join(Config.UPLOAD_DIR, f"{upload_id}_{secure_filename(file.filename)}")
-        file.save(temp_path)
-        file_size = os.path.getsize(temp_path)
-        
-        logger.info(f"User {session.get('session_id')} uploaded: {file.filename} ({format_size(file_size)})")
-        
-        if celery and request.args.get('async') == 'true':
-            task = extract_archive_task.delay(temp_path, workspace['id'], file.filename)
-            return jsonify({
-                'success': True,
-                'async': True,
-                'task_id': task.id,
-                'extract_id': workspace['id']
-            })
-        
+            return jsonify({"error": "No file uploaded"}), 400
+
+        f = request.files['file']
+
+        if f.filename == '':
+            return jsonify({"error": "Empty filename"}), 400
+
+        if not allowed_file(f.filename):
+            return jsonify({"error": "File type not allowed. Allowed: ZIP, TAR, GZ, BZ2"}), 400
+
+        ws = get_workspace()
+
+        # Check workspace size
+        if ws['size'] > Config.MAX_WORKSPACE_SIZE:
+            return jsonify({"error": "Workspace full. Please clear old files."}), 413
+
+        # Save uploaded file
+        filename = secure_filename(f.filename)
+        unique_id = uuid.uuid4().hex[:8]
+        temp_path = os.path.join(Config.UPLOAD_DIR, f"{unique_id}_{filename}")
+        f.save(temp_path)
+
         try:
-            start_time = time.time()
-            handler = get_extraction_handler(temp_path)
-            extracted_files = handler(temp_path, workspace['path'])
-            elapsed = time.time() - start_time
-            
-            file_list = []
-            total_size = 0
-            for f in extracted_files:
-                total_size += f['size']
-                file_list.append({
-                    'name': f['name'],
-                    'size': f['size'],
-                    'size_formatted': format_size(f['size'])
-                })
-            
-            workspace_manager.update_workspace_files(workspace['id'], file_list, total_size)
+            # Extract with timeout
+            files, total_size = run_with_timeout(
+                extract_archive, 
+                Config.EXTRACT_TIMEOUT, 
+                temp_path, 
+                ws["path"]
+            )
+
+            # Update workspace
+            ws["files"] = files
+            ws["size"] = total_size
+
+            # Clean up uploaded file
             os.remove(temp_path)
-            
+
             return jsonify({
-                'success': True,
-                'async': False,
-                'extract_id': workspace['id'],
-                'filename': file.filename,
-                'file_size': file_size,
-                'file_size_formatted': format_size(file_size),
-                'total_files': len(file_list),
-                'total_size': total_size,
-                'total_size_formatted': format_size(total_size),
-                'extract_time': round(elapsed, 2),
-                'files': file_list
+                "success": True,
+                "filename": filename,
+                "count": len(files),
+                "total_size": total_size,
+                "total_size_formatted": format_size(total_size),
+                "files": files,
+                "extract_time": "OK"
             })
-            
+
         except Exception as e:
             if os.path.exists(temp_path):
                 os.remove(temp_path)
-            raise
-            
+            raise e
+
     except Exception as e:
-        logger.error(f"Upload error: {traceback.format_exc()}")
-        return jsonify({'error': str(e)}), 500
+        logger.error(f"Upload error: {str(e)}")
+        return jsonify({"error": str(e)}), 500
 
 
 @app.route('/api/workspace')
-def get_workspace_api():
-    workspace = get_user_workspace()
+def get_workspace_info():
+    """Get current workspace info"""
+    ws = get_workspace()
     return jsonify({
-        'success': True,
-        'extract_id': workspace['id'],
-        'total_files': len(workspace['files']),
-        'total_size': workspace['total_size'],
-        'total_size_formatted': format_size(workspace['total_size']),
-        'files': workspace['files']
+        "success": True,
+        "id": ws["id"],
+        "files": ws["files"],
+        "count": len(ws["files"]),
+        "total_size": ws["size"],
+        "total_size_formatted": format_size(ws["size"])
     })
 
 
-@app.route('/api/download/<filename>')
-def download_file_api(filename):
-    workspace = get_user_workspace()
-    file_path = os.path.join(workspace['path'], filename)
-    
-    real_path = os.path.realpath(file_path)
-    if not real_path.startswith(os.path.realpath(workspace['path'])):
-        return jsonify({'error': 'Invalid file path'}), 403
-    
-    if not os.path.exists(real_path):
-        return jsonify({'error': 'File not found'}), 404
-    
+@app.route('/api/download/<path:name>')
+def download(name):
+    """Download a single file"""
+    ws = get_workspace()
+    file_path = os.path.join(ws["path"], name)
+
+    try:
+        safe_path(ws["path"], file_path)
+    except Exception:
+        return jsonify({"error": "Invalid file path"}), 403
+
+    if not os.path.exists(file_path):
+        return jsonify({"error": "File not found"}), 404
+
     return send_file(
-        real_path,
+        file_path,
         as_attachment=True,
-        download_name=os.path.basename(filename)
+        download_name=os.path.basename(name)
     )
 
 
 @app.route('/api/download-all')
 def download_all():
-    workspace = get_user_workspace()
-    
+    """Download all files as ZIP"""
+    ws = get_workspace()
+
+    if len(ws["files"]) == 0:
+        return jsonify({"error": "No files to download"}), 400
+
+    # Create ZIP in memory
     memory_file = io.BytesIO()
+
     with zipfile.ZipFile(memory_file, 'w', zipfile.ZIP_DEFLATED) as zf:
-        for root, _, files in os.walk(workspace['path']):
-            for file in files:
-                file_path = os.path.join(root, file)
-                arcname = os.path.relpath(file_path, workspace['path'])
-                zf.write(file_path, arcname)
-    
+        for root, _, files in os.walk(ws["path"]):
+            for f in files:
+                full_path = os.path.join(root, f)
+                arcname = os.path.relpath(full_path, ws["path"])
+                zf.write(full_path, arcname)
+
     memory_file.seek(0)
-    
+
     return send_file(
         memory_file,
         as_attachment=True,
-        download_name=f"extracted_{workspace['id']}.zip",
+        download_name=f"extracted_{ws['id']}.zip",
         mimetype='application/zip'
     )
 
 
 @app.route('/api/delete', methods=['DELETE'])
-def delete_workspace_api():
-    workspace = get_user_workspace()
-    workspace_manager.delete_workspace(workspace['id'])
-    session.pop('workspace_id', None)
-    return jsonify({'success': True})
+def delete_workspace():
+    """Delete current workspace"""
+    ws = get_workspace()
+    workspace_manager.delete(ws["id"])
+    session.clear()
+    return jsonify({"success": True})
 
 
-@app.route('/api/delete-file/<filename>', methods=['DELETE'])
-def delete_file_api(filename):
-    workspace = get_user_workspace()
-    file_path = os.path.join(workspace['path'], filename)
-    
-    real_path = os.path.realpath(file_path)
-    if not real_path.startswith(os.path.realpath(workspace['path'])):
-        return jsonify({'error': 'Invalid file path'}), 403
-    
-    if os.path.exists(real_path):
-        os.remove(real_path)
-        new_files = [f for f in workspace['files'] if f['name'] != filename]
-        new_size = sum(f['size'] for f in new_files)
-        workspace_manager.update_workspace_files(workspace['id'], new_files, new_size)
-    
-    return jsonify({'success': True})
+@app.route('/api/delete-file/<path:name>', methods=['DELETE'])
+def delete_file(name):
+    """Delete a single file"""
+    ws = get_workspace()
+    file_path = os.path.join(ws["path"], name)
+
+    try:
+        safe_path(ws["path"], file_path)
+    except Exception:
+        return jsonify({"error": "Invalid file path"}), 403
+
+    if os.path.exists(file_path):
+        os.remove(file_path)
+
+        # Update workspace
+        ws["files"] = [f for f in ws["files"] if f["name"] != name]
+        ws["size"] = sum(f["size"] for f in ws["files"])
+
+    return jsonify({"success": True})
 
 
-# ==================== HTML Template ====================
+@app.route('/api/clear', methods=['DELETE'])
+def clear_workspace():
+    """Clear all files in workspace"""
+    ws = get_workspace()
+    for root, dirs, files in os.walk(ws["path"]):
+        for f in files:
+            os.remove(os.path.join(root, f))
+    ws["files"] = []
+    ws["size"] = 0
+    return jsonify({"success": True})
 
-HTML_TEMPLATE_MULTI = '''
+
+# ==================== HTML TEMPLATE ====================
+
+HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="vi">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Web Unzip Pro - Multi-User Edition</title>
+    <title>Web Unzip Pro - Giải nén file trực tuyến</title>
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
     <style>
-        body { background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%); font-family: 'Segoe UI', sans-serif; min-height: 100vh; padding: 20px; }
-        .card { border-radius: 20px; box-shadow: 0 20px 60px rgba(0,0,0,0.3); background: rgba(255,255,255,0.98); }
-        .card-header { background: linear-gradient(135deg, #4361ee 0%, #3a0ca3 100%); color: white; border-radius: 20px 20px 0 0 !important; }
-        .upload-area { border: 3px dashed #4361ee; border-radius: 20px; padding: 60px 20px; text-align: center; cursor: pointer; transition: all 0.3s; background: #f8f9fa; }
-        .upload-area:hover, .upload-area.drag-over { border-color: #06ffa5; background: #e9ecef; transform: scale(1.01); }
-        .stats-card { background: linear-gradient(135deg, #1e1e2f, #2d2d44); color: white; border-radius: 15px; padding: 20px; text-align: center; }
-        .stats-number { font-size: 32px; font-weight: bold; color: #06ffa5; }
-        .file-item { background: white; border-radius: 12px; padding: 15px; margin-bottom: 12px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); transition: all 0.2s; }
-        .file-item:hover { transform: translateX(5px); }
-        .toast-notification { position: fixed; bottom: 20px; right: 20px; z-index: 9999; }
-        .fade-in { animation: fadeIn 0.3s ease; }
-        @keyframes fadeIn { from { opacity: 0; transform: translateY(20px); } to { opacity: 1; transform: translateY(0); } }
-        .session-id { font-size: 11px; font-family: monospace; background: rgba(255,255,255,0.2); padding: 4px 8px; border-radius: 20px; }
+        body {
+            background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+            font-family: 'Segoe UI', sans-serif;
+            min-height: 100vh;
+            padding: 20px;
+        }
+        .card {
+            border-radius: 20px;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+            background: rgba(255,255,255,0.98);
+        }
+        .card-header {
+            background: linear-gradient(135deg, #4361ee 0%, #3a0ca3 100%);
+            color: white;
+            border-radius: 20px 20px 0 0 !important;
+            padding: 25px;
+        }
+        .upload-area {
+            border: 3px dashed #4361ee;
+            border-radius: 20px;
+            padding: 60px 20px;
+            text-align: center;
+            cursor: pointer;
+            transition: all 0.3s;
+            background: #f8f9fa;
+        }
+        .upload-area:hover, .upload-area.drag-over {
+            border-color: #06ffa5;
+            background: #e9ecef;
+            transform: scale(1.01);
+        }
+        .stats-card {
+            background: linear-gradient(135deg, #1e1e2f, #2d2d44);
+            color: white;
+            border-radius: 15px;
+            padding: 20px;
+            text-align: center;
+        }
+        .stats-number {
+            font-size: 32px;
+            font-weight: bold;
+            color: #06ffa5;
+        }
+        .file-item {
+            background: white;
+            border-radius: 12px;
+            padding: 15px;
+            margin-bottom: 12px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+            transition: all 0.2s;
+        }
+        .file-item:hover {
+            transform: translateX(5px);
+            box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+        }
+        .toast-notification {
+            position: fixed;
+            bottom: 20px;
+            right: 20px;
+            z-index: 9999;
+        }
+        .fade-in {
+            animation: fadeIn 0.3s ease;
+        }
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(20px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+        .spinner-border-sm {
+            width: 1rem;
+            height: 1rem;
+        }
+        .session-id {
+            font-size: 11px;
+            font-family: monospace;
+            background: rgba(255,255,255,0.2);
+            padding: 4px 8px;
+            border-radius: 20px;
+        }
     </style>
 </head>
 <body>
@@ -649,43 +572,71 @@ HTML_TEMPLATE_MULTI = '''
             <div class="card-header">
                 <div class="row align-items-center">
                     <div class="col-md-8">
-                        <h2><i class="fas fa-users me-2"></i> Web Unzip Pro - Multi-User</h2>
-                        <p class="mb-0"><i class="fas fa-globe me-1"></i> Hỗ trợ nhiều người dùng cùng lúc | Mỗi người có workspace riêng</p>
+                        <h2><i class="fas fa-file-archive me-2"></i> Web Unzip Pro</h2>
+                        <p class="mb-0">Giải nén ZIP, TAR, GZ, BZ2 trực tuyến | Bảo mật | Không giới hạn</p>
                     </div>
                     <div class="col-md-4 text-end">
-                        <i class="fas fa-rocket fa-2x"></i>
-                        <span class="badge bg-success ms-2">Multi-User Ready</span>
+                        <i class="fas fa-shield-alt fa-2x"></i>
+                        <span class="badge bg-success ms-2">Stable</span>
                     </div>
                 </div>
                 <div class="mt-2 small">
-                    <i class="fas fa-fingerprint me-1"></i> Session: <span class="session-id" id="sessionId">Loading...</span>
+                    <i class="fas fa-fingerprint me-1"></i> Workspace ID: <span class="session-id" id="sessionId">Loading...</span>
                 </div>
             </div>
             <div class="card-body p-4">
+                <!-- Upload Area -->
                 <div class="upload-area" id="uploadArea">
                     <i class="fas fa-cloud-upload-alt fa-4x mb-3" style="color: #4361ee;"></i>
                     <h4>Kéo thả file nén vào đây</h4>
-                    <p class="text-muted">Hỗ trợ ZIP, RAR, 7Z, TAR, GZ, BZ2 | Mỗi người dùng có workspace riêng biệt</p>
-                    <input type="file" id="fileInput" accept=".zip,.rar,.7z,.tar,.gz,.bz2,.tgz,.tbz2" style="display: none;">
+                    <p class="text-muted">Hỗ trợ ZIP, TAR, GZ, BZ2 | Tối đa 10,000 file | Mỗi file ≤ 200MB</p>
+                    <input type="file" id="fileInput" accept=".zip,.tar,.gz,.tgz,.bz2,.tbz2" style="display: none;">
                     <button class="btn btn-primary mt-3" onclick="document.getElementById('fileInput').click()">
                         <i class="fas fa-folder-open me-2"></i> Chọn file
                     </button>
                 </div>
 
+                <!-- Stats -->
                 <div class="row mt-4 g-3" id="statsRow" style="display: none;">
-                    <div class="col-md-4"><div class="stats-card"><i class="fas fa-file-archive fa-2x mb-2"></i><div class="stats-number" id="totalFiles">0</div><div>File đã giải nén</div></div></div>
-                    <div class="col-md-4"><div class="stats-card"><i class="fas fa-database fa-2x mb-2"></i><div class="stats-number" id="totalSize">0</div><div>MB đã xử lý</div></div></div>
-                    <div class="col-md-4"><div class="stats-card"><i class="fas fa-clock fa-2x mb-2"></i><div class="stats-number" id="extractTime">0</div><div>giây</div></div></div>
-                </div>
-
-                <div class="row mt-4" id="controlsRow" style="display: none;">
-                    <div class="col-md-6"><input type="text" id="searchInput" class="form-control" placeholder="🔍 Tìm kiếm file..."></div>
-                    <div class="col-md-6 text-end">
-                        <button class="btn btn-outline-success me-2" id="downloadAllBtn"><i class="fas fa-download me-2"></i>Tải tất cả</button>
-                        <button class="btn btn-outline-danger" id="clearAllBtn"><i class="fas fa-trash me-2"></i>Xóa tất cả</button>
+                    <div class="col-md-4">
+                        <div class="stats-card">
+                            <i class="fas fa-file-archive fa-2x mb-2"></i>
+                            <div class="stats-number" id="totalFiles">0</div>
+                            <div>File đã giải nén</div>
+                        </div>
+                    </div>
+                    <div class="col-md-4">
+                        <div class="stats-card">
+                            <i class="fas fa-database fa-2x mb-2"></i>
+                            <div class="stats-number" id="totalSize">0</div>
+                            <div>Dung lượng</div>
+                        </div>
+                    </div>
+                    <div class="col-md-4">
+                        <div class="stats-card">
+                            <i class="fas fa-check-circle fa-2x mb-2"></i>
+                            <div class="stats-number" id="status">✅</div>
+                            <div>Trạng thái</div>
+                        </div>
                     </div>
                 </div>
 
+                <!-- Controls -->
+                <div class="row mt-4" id="controlsRow" style="display: none;">
+                    <div class="col-md-6">
+                        <input type="text" id="searchInput" class="form-control" placeholder="🔍 Tìm kiếm file...">
+                    </div>
+                    <div class="col-md-6 text-end">
+                        <button class="btn btn-outline-success me-2" id="downloadAllBtn">
+                            <i class="fas fa-download me-2"></i>Tải tất cả
+                        </button>
+                        <button class="btn btn-outline-danger" id="clearAllBtn">
+                            <i class="fas fa-trash me-2"></i>Xóa tất cả
+                        </button>
+                    </div>
+                </div>
+
+                <!-- File List -->
                 <div id="fileList" class="mt-4" style="max-height: 500px; overflow-y: auto;"></div>
                 <div id="queueStatus" class="mt-3"></div>
             </div>
@@ -696,26 +647,28 @@ HTML_TEMPLATE_MULTI = '''
     <script>
         let extractedFiles = [];
         let currentWorkspaceId = null;
-        
+
         async function getWorkspace() {
             try {
                 const res = await fetch('/api/workspace');
                 const data = await res.json();
                 if (data.success) {
-                    currentWorkspaceId = data.extract_id;
+                    currentWorkspaceId = data.id;
                     extractedFiles = data.files;
-                    document.getElementById('sessionId').textContent = currentWorkspaceId.substring(0, 16);
-                    if (data.total_files > 0) {
+                    document.getElementById('sessionId').textContent = currentWorkspaceId;
+                    if (data.count > 0) {
                         document.getElementById('statsRow').style.display = 'flex';
                         document.getElementById('controlsRow').style.display = 'flex';
-                        document.getElementById('totalFiles').textContent = data.total_files;
-                        document.getElementById('totalSize').textContent = (data.total_size / (1024 * 1024)).toFixed(1);
+                        document.getElementById('totalFiles').textContent = data.count;
+                        document.getElementById('totalSize').textContent = data.total_size_formatted;
                         renderFileList();
                     }
                 }
-            } catch(e) {}
+            } catch(e) {
+                console.error(e);
+            }
         }
-        
+
         function showToast(message, type = 'success') {
             const toast = document.getElementById('toast');
             const colors = { success: '#10b981', error: '#ef4444', info: '#3b82f6', warning: '#f59e0b' };
@@ -724,30 +677,29 @@ HTML_TEMPLATE_MULTI = '''
             </div>`;
             setTimeout(() => toast.innerHTML = '', 3000);
         }
-        
+
         async function uploadFile(file) {
             const formData = new FormData();
             formData.append('file', file);
-            
+
             showToast(`Đang xử lý ${file.name}...`, 'info');
-            document.getElementById('queueStatus').innerHTML = '<div class="alert alert-info"><i class="fas fa-spinner fa-spin me-2"></i>Đang xử lý...</div>';
-            
+            document.getElementById('queueStatus').innerHTML = '<div class="alert alert-info"><i class="fas fa-spinner fa-spin me-2"></i>Đang giải nén...</div>';
+
             try {
                 const response = await fetch('/api/upload', { method: 'POST', body: formData });
                 const data = await response.json();
-                
+
                 if (data.success) {
-                    currentWorkspaceId = data.extract_id;
                     extractedFiles = data.files;
-                    
+                    currentWorkspaceId = data.workspace_id;
+
                     document.getElementById('statsRow').style.display = 'flex';
                     document.getElementById('controlsRow').style.display = 'flex';
-                    document.getElementById('totalFiles').textContent = data.total_files;
-                    document.getElementById('totalSize').textContent = (data.total_size / (1024 * 1024)).toFixed(1);
-                    document.getElementById('extractTime').textContent = data.extract_time || 0;
-                    
+                    document.getElementById('totalFiles').textContent = data.count;
+                    document.getElementById('totalSize').textContent = data.total_size_formatted;
+
                     renderFileList();
-                    showToast(`✅ Thành công! ${data.total_files} file (${data.extract_time || '?'}s)`, 'success');
+                    showToast(`✅ Thành công! ${data.count} file (${data.total_size_formatted})`, 'success');
                 } else {
                     showToast(`❌ Lỗi: ${data.error}`, 'error');
                 }
@@ -756,39 +708,58 @@ HTML_TEMPLATE_MULTI = '''
             }
             document.getElementById('queueStatus').innerHTML = '';
         }
-        
+
         function renderFileList() {
             const searchTerm = document.getElementById('searchInput').value.toLowerCase();
             let filtered = searchTerm ? extractedFiles.filter(f => f.name.toLowerCase().includes(searchTerm)) : extractedFiles;
-            
+
             if (filtered.length === 0) {
                 document.getElementById('fileList').innerHTML = '<div class="text-center text-muted py-5"><i class="fas fa-folder-open fa-3x mb-3"></i><br>Chưa có file nào</div>';
                 return;
             }
-            
+
             document.getElementById('fileList').innerHTML = filtered.map(file => `
                 <div class="file-item fade-in">
                     <div class="row align-items-center">
-                        <div class="col-auto"><i class="fas fa-file fa-2x text-primary"></i></div>
+                        <div class="col-auto">
+                            <i class="fas fa-file fa-2x text-primary"></i>
+                        </div>
                         <div class="col">
                             <div class="fw-bold">${escapeHtml(file.name)}</div>
-                            <small class="text-muted">${file.size_formatted}</small>
+                            <small class="text-muted">${file.size_formatted || formatSize(file.size)}</small>
                         </div>
                         <div class="col-auto">
-                            <button class="btn btn-sm btn-outline-primary me-2" onclick="downloadFile('${encodeURIComponent(file.name)}')"><i class="fas fa-download"></i></button>
-                            <button class="btn btn-sm btn-outline-danger" onclick="deleteFile('${encodeURIComponent(file.name)}')"><i class="fas fa-trash"></i></button>
+                            <button class="btn btn-sm btn-outline-primary me-2" onclick="downloadFile('${encodeURIComponent(file.name)}')">
+                                <i class="fas fa-download"></i>
+                            </button>
+                            <button class="btn btn-sm btn-outline-danger" onclick="deleteFile('${encodeURIComponent(file.name)}')">
+                                <i class="fas fa-trash"></i>
+                            </button>
                         </div>
                     </div>
                 </div>
             `).join('');
         }
-        
-        function escapeHtml(str) { return str.replace(/[&<>]/g, m => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[m])); }
-        
+
+        function formatSize(bytes) {
+            if (bytes === 0) return '0 B';
+            const units = ['B', 'KB', 'MB', 'GB'];
+            let i = 0;
+            while (bytes >= 1024 && i < units.length - 1) {
+                bytes /= 1024;
+                i++;
+            }
+            return bytes.toFixed(1) + ' ' + units[i];
+        }
+
+        function escapeHtml(str) {
+            return str.replace(/[&<>]/g, m => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[m]));
+        }
+
         window.downloadFile = function(filename) {
             window.open(`/api/download/${filename}`, '_blank');
         };
-        
+
         window.deleteFile = async function(filename) {
             if (confirm(`Xóa file ${filename}?`)) {
                 await fetch(`/api/delete-file/${encodeURIComponent(filename)}`, { method: 'DELETE' });
@@ -798,40 +769,49 @@ HTML_TEMPLATE_MULTI = '''
                 showToast('Đã xóa', 'info');
             }
         };
-        
+
         document.getElementById('downloadAllBtn').onclick = () => {
             if (extractedFiles.length) window.open('/api/download-all', '_blank');
         };
-        
+
         document.getElementById('clearAllBtn').onclick = async () => {
             if (extractedFiles.length && confirm('Xóa tất cả file?')) {
-                await fetch('/api/delete', { method: 'DELETE' });
+                await fetch('/api/clear', { method: 'DELETE' });
                 extractedFiles = [];
                 renderFileList();
                 document.getElementById('statsRow').style.display = 'none';
                 document.getElementById('controlsRow').style.display = 'none';
-                showToast('Đã xóa workspace', 'info');
+                showToast('Đã xóa tất cả', 'info');
             }
         };
-        
+
         document.getElementById('searchInput').addEventListener('input', renderFileList);
-        
+
+        // Drag & Drop
         const uploadArea = document.getElementById('uploadArea');
         const fileInput = document.getElementById('fileInput');
-        
+
         uploadArea.addEventListener('dragover', e => { e.preventDefault(); uploadArea.classList.add('drag-over'); });
         uploadArea.addEventListener('dragleave', () => uploadArea.classList.remove('drag-over'));
-        uploadArea.addEventListener('drop', e => { e.preventDefault(); uploadArea.classList.remove('drag-over'); uploadFile(e.dataTransfer.files[0]); });
+        uploadArea.addEventListener('drop', e => {
+            e.preventDefault();
+            uploadArea.classList.remove('drag-over');
+            uploadFile(e.dataTransfer.files[0]);
+        });
         uploadArea.addEventListener('click', () => fileInput.click());
-        fileInput.addEventListener('change', e => { if (e.target.files[0]) uploadFile(e.target.files[0]); fileInput.value = ''; });
-        
+        fileInput.addEventListener('change', e => {
+            if (e.target.files[0]) uploadFile(e.target.files[0]);
+            fileInput.value = '';
+        });
+
         getWorkspace();
-        showToast('🚀 Web Unzip Pro Multi-User sẵn sàng | Mỗi người dùng có workspace riêng', 'success');
+        showToast('🚀 Web Unzip Pro sẵn sàng! Kéo thả file ZIP/TAR vào đây.', 'success');
     </script>
 </body>
 </html>
-'''
+"""
 
-# ==================== Application Entry ====================
-if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000, debug=True)
+# ==================== RUN ====================
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=5000, debug=True)
