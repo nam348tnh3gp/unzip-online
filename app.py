@@ -828,18 +828,24 @@ HTML_TEMPLATE = """
             }
         }
 
+        // HÀM PREVIEW ĐÃ SỬA - XỬ LÝ ĐÚNG ĐƯỜNG DẪN CÓ DẤU "/"
         async function previewFile(filename) {
             currentPreviewFile = filename;
             const modal = new bootstrap.Modal(document.getElementById('previewModal'));
             const previewBody = document.getElementById('previewBody');
             const previewTitle = document.getElementById('previewTitle');
             
-            previewTitle.innerHTML = `<i class="fas fa-eye me-2"></i>${filename}`;
+            previewTitle.innerHTML = `<i class="fas fa-eye me-2"></i>${escapeHtml(filename)}`;
             previewBody.innerHTML = '<div class="text-center p-5"><i class="fas fa-spinner fa-spin fa-2x mb-3"></i><br>Đang tải...</div>';
             modal.show();
             
             try {
-                const res = await fetch(`/api/preview/${encodeURIComponent(filename)}`);
+                // QUAN TRỌNG: encode từng phần của đường dẫn, giữ nguyên dấu /
+                const encodedFilename = filename.split('/').map(part => encodeURIComponent(part)).join('/');
+                const url = `/api/preview/${encodedFilename}`;
+                console.log('Preview URL:', url);
+                
+                const res = await fetch(url);
                 const data = await res.json();
                 
                 if (data.success) {
@@ -856,21 +862,22 @@ HTML_TEMPLATE = """
                         previewBody.innerHTML = `
                             <div class="text-center p-4">
                                 <div class="mb-2 text-muted small">${data.size_formatted}</div>
-                                <img src="${data.data}" class="preview-image" alt="${filename}">
+                                <img src="${data.data}" class="preview-image" alt="${escapeHtml(filename)}">
                             </div>
                         `;
                     }
                 } else {
                     previewBody.innerHTML = `
                         <div class="alert alert-danger m-4">
-                            <i class="fas fa-exclamation-triangle me-2"></i> ${data.error || 'Không thể xem file này'}
+                            <i class="fas fa-exclamation-triangle me-2"></i> ${escapeHtml(data.error || 'Không thể xem file này')}
                         </div>
                     `;
                 }
             } catch (err) {
+                console.error('Preview error:', err);
                 previewBody.innerHTML = `
                     <div class="alert alert-danger m-4">
-                        <i class="fas fa-exclamation-triangle me-2"></i> Lỗi: ${err.message}
+                        <i class="fas fa-exclamation-triangle me-2"></i> Lỗi: ${escapeHtml(err.message)}
                     </div>
                 `;
             }
@@ -878,7 +885,9 @@ HTML_TEMPLATE = """
         
         document.getElementById('previewDownloadBtn').addEventListener('click', () => {
             if (currentPreviewFile) {
-                window.open(`/api/download/${encodeURIComponent(currentPreviewFile)}`, '_blank');
+                // Cũng encode đúng cách cho download
+                const encodedFilename = currentPreviewFile.split('/').map(part => encodeURIComponent(part)).join('/');
+                window.open(`/api/download/${encodedFilename}`, '_blank');
             }
         });
 
@@ -957,6 +966,9 @@ HTML_TEMPLATE = """
                     tagText = 'IMG';
                 }
                 
+                // QUAN TRỌNG: Escape filename để truyền vào hàm preview
+                const escapedFilename = file.name.replace(/'/g, "\\'");
+                
                 return `
                 <div class="file-item fade-in">
                     <div class="row align-items-center">
@@ -971,13 +983,13 @@ HTML_TEMPLATE = """
                             <small class="text-muted">${file.size_formatted || formatSize(file.size)}</small>
                         </div>
                         <div class="col-auto">
-                            <button type="button" class="btn btn-sm btn-outline-info me-1" onclick="previewFile('${encodeURIComponent(file.name)}')" title="Xem trước">
+                            <button type="button" class="btn btn-sm btn-outline-info me-1" onclick="previewFile('${escapedFilename}')" title="Xem trước">
                                 <i class="fas fa-eye"></i>
                             </button>
-                            <button type="button" class="btn btn-sm btn-outline-primary me-1" onclick="downloadFile('${encodeURIComponent(file.name)}')" title="Tải xuống">
+                            <button type="button" class="btn btn-sm btn-outline-primary me-1" onclick="downloadFile('${escapedFilename}')" title="Tải xuống">
                                 <i class="fas fa-download"></i>
                             </button>
-                            <button type="button" class="btn btn-sm btn-outline-danger" onclick="deleteFile('${encodeURIComponent(file.name)}')" title="Xóa">
+                            <button type="button" class="btn btn-sm btn-outline-danger" onclick="deleteFile('${escapedFilename}')" title="Xóa">
                                 <i class="fas fa-trash-alt"></i>
                             </button>
                         </div>
@@ -1005,14 +1017,16 @@ HTML_TEMPLATE = """
 
         window.downloadFile = function(filename) {
             if (!filename) return;
-            window.open(`/api/download/${filename}`, '_blank');
+            const encodedFilename = filename.split('/').map(part => encodeURIComponent(part)).join('/');
+            window.open(`/api/download/${encodedFilename}`, '_blank');
             showToast(`📥 Đang tải ${filename}`, 'info');
         };
 
         window.deleteFile = async function(filename) {
             if (!filename) return;
             if (confirm(`Xóa file "${filename}"?`)) {
-                const res = await fetch(`/api/delete-file/${encodeURIComponent(filename)}`, { method: 'DELETE' });
+                const encodedFilename = encodeURIComponent(filename);
+                const res = await fetch(`/api/delete-file/${encodedFilename}`, { method: 'DELETE' });
                 if (res.ok) {
                     extractedFiles = extractedFiles.filter(f => f.name !== filename);
                     renderFileList();
