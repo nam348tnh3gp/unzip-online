@@ -292,14 +292,13 @@ def upload():
             files, total_size = extract_archive(temp_path, ws["path"])
             elapsed = time.time() - start_time
 
-            # Update workspace - THÊM FILE MỚI VÀO DANH SÁCH
+            # Update workspace
             ws["files"].extend(files)
             ws["size"] += total_size
 
             # Clean up uploaded file
             os.remove(temp_path)
 
-            # TRẢ VỀ ĐẦY ĐỦ DỮ LIỆU CHO FRONTEND
             return jsonify({
                 "success": True,
                 "filename": filename,
@@ -307,7 +306,7 @@ def upload():
                 "total_files": len(ws["files"]),
                 "total_size": ws["size"],
                 "total_size_formatted": format_size(ws["size"]),
-                "files": ws["files"],  # ← QUAN TRỌNG: trả về toàn bộ file list
+                "files": ws["files"],
                 "extract_time": round(elapsed, 2)
             })
 
@@ -382,7 +381,7 @@ def delete_file(name):
     if os.path.exists(file_path):
         os.remove(file_path)
 
-        # Update workspace - XÓA FILE KHỎI DANH SÁCH
+        # Update workspace
         ws["files"] = [f for f in ws["files"] if f["name"] != name]
         ws["size"] = sum(f["size"] for f in ws["files"])
 
@@ -491,7 +490,6 @@ HTML_TEMPLATE = """
             from { opacity: 0; transform: translateY(20px); }
             to { opacity: 1; transform: translateY(0); }
         }
-        .spinner-border-sm { width: 1rem; height: 1rem; }
         .session-id {
             font-size: 11px;
             font-family: monospace;
@@ -563,7 +561,7 @@ HTML_TEMPLATE = """
                     <h4>Kéo thả file nén vào đây</h4>
                     <p class="text-muted">Hỗ trợ ZIP, TAR, GZ, BZ2 | Tối đa 20,000 file | Mỗi file ≤ 500MB | Tổng ≤ 5GB</p>
                     <input type="file" id="fileInput" accept=".zip,.tar,.gz,.tgz,.bz2,.tbz2" style="display: none;">
-                    <button class="btn btn-primary mt-3" onclick="document.getElementById('fileInput').click()">
+                    <button type="button" class="btn btn-primary mt-3" id="selectFileBtn">
                         <i class="fas fa-folder-open me-2"></i> Chọn file
                     </button>
                 </div>
@@ -611,10 +609,10 @@ HTML_TEMPLATE = """
                         <input type="text" id="searchInput" class="form-control search-box" placeholder="🔍 Tìm kiếm file theo tên...">
                     </div>
                     <div class="col-md-7 text-end">
-                        <button class="btn btn-outline-success btn-custom me-2" id="downloadAllBtn">
+                        <button type="button" class="btn btn-outline-success btn-custom me-2" id="downloadAllBtn">
                             <i class="fas fa-download me-2"></i>Tải tất cả (ZIP)
                         </button>
-                        <button class="btn btn-outline-danger btn-custom" id="clearAllBtn">
+                        <button type="button" class="btn btn-outline-danger btn-custom" id="clearAllBtn">
                             <i class="fas fa-trash-alt me-2"></i>Xóa tất cả
                         </button>
                     </div>
@@ -635,6 +633,14 @@ HTML_TEMPLATE = """
         let extractedFiles = [];
         let currentWorkspaceId = null;
         let startTime = null;
+
+        // DOM elements
+        const uploadArea = document.getElementById('uploadArea');
+        const fileInput = document.getElementById('fileInput');
+        const selectFileBtn = document.getElementById('selectFileBtn');
+        const downloadAllBtn = document.getElementById('downloadAllBtn');
+        const clearAllBtn = document.getElementById('clearAllBtn');
+        const searchInput = document.getElementById('searchInput');
 
         async function getWorkspace() {
             try {
@@ -685,6 +691,14 @@ HTML_TEMPLATE = """
                 return;
             }
 
+            // Kiểm tra định dạng file
+            const allowedExts = ['zip', 'tar', 'gz', 'tgz', 'bz2', 'tbz2'];
+            const ext = file.name.split('.').pop().toLowerCase();
+            if (!allowedExts.includes(ext)) {
+                showToast('Định dạng file không được hỗ trợ. Chỉ hỗ trợ: ZIP, TAR, GZ, BZ2', 'error');
+                return;
+            }
+
             const formData = new FormData();
             formData.append('file', file);
             startTime = Date.now();
@@ -709,7 +723,6 @@ HTML_TEMPLATE = """
                 document.getElementById('extractTime').textContent = elapsed;
 
                 if (data.success) {
-                    // CẬP NHẬT DANH SÁCH FILE TỪ SERVER
                     extractedFiles = data.files || [];
                     
                     document.getElementById('statsRow').style.display = 'flex';
@@ -733,7 +746,7 @@ HTML_TEMPLATE = """
         }
 
         function renderFileList() {
-            const searchTerm = document.getElementById('searchInput').value.toLowerCase();
+            const searchTerm = searchInput.value.toLowerCase();
             let filtered = searchTerm ? extractedFiles.filter(f => f.name.toLowerCase().includes(searchTerm)) : extractedFiles;
 
             if (!filtered || filtered.length === 0) {
@@ -752,10 +765,10 @@ HTML_TEMPLATE = """
                             <small class="text-muted">${file.size_formatted || formatSize(file.size)}</small>
                         </div>
                         <div class="col-auto">
-                            <button class="btn btn-sm btn-outline-primary me-2" onclick="downloadFile('${encodeURIComponent(file.name)}')" title="Tải xuống">
+                            <button type="button" class="btn btn-sm btn-outline-primary me-2" onclick="downloadFile('${encodeURIComponent(file.name)}')" title="Tải xuống">
                                 <i class="fas fa-download"></i>
                             </button>
-                            <button class="btn btn-sm btn-outline-danger" onclick="deleteFile('${encodeURIComponent(file.name)}')" title="Xóa">
+                            <button type="button" class="btn btn-sm btn-outline-danger" onclick="deleteFile('${encodeURIComponent(file.name)}')" title="Xóa">
                                 <i class="fas fa-trash-alt"></i>
                             </button>
                         </div>
@@ -802,16 +815,30 @@ HTML_TEMPLATE = """
             }
         };
 
-        document.getElementById('downloadAllBtn').onclick = () => {
+        // Event listeners
+        selectFileBtn.addEventListener('click', (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            fileInput.click();
+        });
+
+        fileInput.addEventListener('change', (e) => {
+            if (e.target.files && e.target.files.length > 0) {
+                uploadFile(e.target.files[0]);
+            }
+            fileInput.value = '';
+        });
+
+        downloadAllBtn.addEventListener('click', () => {
             if (extractedFiles && extractedFiles.length) {
                 window.open('/api/download-all', '_blank');
                 showToast(`📦 Đang tải ${extractedFiles.length} file...`, 'info');
             } else {
                 showToast('Không có file để tải', 'warning');
             }
-        };
+        });
 
-        document.getElementById('clearAllBtn').onclick = async () => {
+        clearAllBtn.addEventListener('click', async () => {
             if (extractedFiles && extractedFiles.length && confirm('Xóa TẤT CẢ file trong workspace?')) {
                 const res = await fetch('/api/clear', { method: 'DELETE' });
                 if (res.ok) {
@@ -824,15 +851,12 @@ HTML_TEMPLATE = """
                     showToast('Xóa thất bại', 'error');
                 }
             }
-        };
+        });
 
-        document.getElementById('searchInput').addEventListener('input', renderFileList);
+        searchInput.addEventListener('input', renderFileList);
 
         // Drag & Drop
-        const uploadArea = document.getElementById('uploadArea');
-        const fileInput = document.getElementById('fileInput');
-
-        uploadArea.addEventListener('dragover', e => { 
+        uploadArea.addEventListener('dragover', (e) => { 
             e.preventDefault(); 
             uploadArea.classList.add('drag-over'); 
         });
@@ -841,7 +865,7 @@ HTML_TEMPLATE = """
             uploadArea.classList.remove('drag-over'); 
         });
         
-        uploadArea.addEventListener('drop', e => {
+        uploadArea.addEventListener('drop', (e) => {
             e.preventDefault();
             uploadArea.classList.remove('drag-over');
             const file = e.dataTransfer.files[0];
@@ -850,14 +874,6 @@ HTML_TEMPLATE = """
             } else {
                 showToast('Vui lòng kéo thả file nén', 'warning');
             }
-        });
-        
-        uploadArea.addEventListener('click', () => fileInput.click());
-        fileInput.addEventListener('change', e => {
-            if (e.target.files && e.target.files[0]) {
-                uploadFile(e.target.files[0]);
-            }
-            fileInput.value = '';
         });
 
         // Khởi tạo
