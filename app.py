@@ -264,52 +264,61 @@ def get_workspace_info():
 @app.route('/api/upload', methods=['POST'])
 @limiter.limit(Config.RATE_LIMIT)
 def upload():
-    if 'file' not in request.files:
-        return jsonify({"error": "No file uploaded"}), 400
-
-    f = request.files['file']
-    if f.filename == '':
-        return jsonify({"error": "Empty filename"}), 400
-
-    if not allowed_file(f.filename):
-        return jsonify({"error": "Invalid file type. Allowed: ZIP, TAR, GZ, BZ2"}), 400
-
-    ws = get_workspace()
-
-    # Check workspace capacity
-    if ws["size"] > Config.MAX_WORKSPACE_SIZE:
-        return jsonify({"error": "Workspace full. Clear old files first."}), 413
-
-    # Save uploaded file
-    filename = secure_filename(f.filename)
-    unique_id = uuid.uuid4().hex[:8]
-    temp_path = os.path.join(Config.UPLOAD_DIR, f"{unique_id}_{filename}")
-    f.save(temp_path)
-
     try:
-        files, total_size = extract_archive(temp_path, ws["path"])
+        if 'file' not in request.files:
+            return jsonify({"error": "No file uploaded"}), 400
 
-        # Update workspace
-        ws["files"].extend(files)
-        ws["size"] += total_size
+        f = request.files['file']
+        if f.filename == '':
+            return jsonify({"error": "Empty filename"}), 400
 
-        # Clean up
-        os.remove(temp_path)
+        if not allowed_file(f.filename):
+            return jsonify({"error": "Invalid file type. Allowed: ZIP, TAR, GZ, BZ2"}), 400
 
-        return jsonify({
-            "success": True,
-            "filename": filename,
-            "count": len(files),
-            "total_size": total_size,
-            "total_size_formatted": format_size(total_size),
-            "files": ws["files"],
-            "workspace_total": format_size(ws["size"])
-        })
+        ws = get_workspace()
+
+        # Check workspace capacity
+        if ws["size"] > Config.MAX_WORKSPACE_SIZE:
+            return jsonify({"error": "Workspace full. Clear old files first."}), 413
+
+        # Save uploaded file
+        filename = secure_filename(f.filename)
+        unique_id = uuid.uuid4().hex[:8]
+        temp_path = os.path.join(Config.UPLOAD_DIR, f"{unique_id}_{filename}")
+        f.save(temp_path)
+
+        try:
+            start_time = time.time()
+            files, total_size = extract_archive(temp_path, ws["path"])
+            elapsed = time.time() - start_time
+
+            # Update workspace - THÊM FILE MỚI VÀO DANH SÁCH
+            ws["files"].extend(files)
+            ws["size"] += total_size
+
+            # Clean up uploaded file
+            os.remove(temp_path)
+
+            # TRẢ VỀ ĐẦY ĐỦ DỮ LIỆU CHO FRONTEND
+            return jsonify({
+                "success": True,
+                "filename": filename,
+                "count": len(files),
+                "total_files": len(ws["files"]),
+                "total_size": ws["size"],
+                "total_size_formatted": format_size(ws["size"]),
+                "files": ws["files"],  # ← QUAN TRỌNG: trả về toàn bộ file list
+                "extract_time": round(elapsed, 2)
+            })
+
+        except Exception as e:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+            logger.error(f"Extraction error: {str(e)}")
+            return jsonify({"error": str(e)}), 500
 
     except Exception as e:
-        if os.path.exists(temp_path):
-            os.remove(temp_path)
-        logger.error(f"Extraction error: {str(e)}")
+        logger.error(f"Upload error: {str(e)}")
         return jsonify({"error": str(e)}), 500
 
 
@@ -373,7 +382,7 @@ def delete_file(name):
     if os.path.exists(file_path):
         os.remove(file_path)
 
-        # Update workspace
+        # Update workspace - XÓA FILE KHỎI DANH SÁCH
         ws["files"] = [f for f in ws["files"] if f["name"] != name]
         ws["size"] = sum(f["size"] for f in ws["files"])
 
@@ -495,7 +504,7 @@ HTML_TEMPLATE = """
             background: #e0e0e0;
             border-radius: 3px;
             overflow: hidden;
-            margin-top: 10px;
+            margin: 0 20px 10px 20px;
         }
         .progress-fill {
             height: 100%;
@@ -633,7 +642,7 @@ HTML_TEMPLATE = """
                 const data = await res.json();
                 if (data.success) {
                     currentWorkspaceId = data.id;
-                    extractedFiles = data.files;
+                    extractedFiles = data.files || [];
                     document.getElementById('sessionId').textContent = currentWorkspaceId;
                     if (data.count > 0) {
                         document.getElementById('statsRow').style.display = 'flex';
@@ -644,7 +653,9 @@ HTML_TEMPLATE = """
                         renderFileList();
                     }
                 }
-            } catch(e) { console.error(e); }
+            } catch(e) { 
+                console.error('getWorkspace error:', e);
+            }
         }
 
         function showToast(message, type = 'success') {
@@ -669,41 +680,54 @@ HTML_TEMPLATE = """
         }
 
         async function uploadFile(file) {
+            if (!file) {
+                showToast('Vui lòng chọn file', 'warning');
+                return;
+            }
+
             const formData = new FormData();
             formData.append('file', file);
             startTime = Date.now();
 
             showToast(`📦 Đang xử lý ${file.name}...`, 'info');
-            showProgress(true, 10);
+            showProgress(true, 20);
             document.getElementById('queueStatus').innerHTML = '<div class="alert alert-info"><i class="fas fa-spinner fa-spin me-2"></i>Đang giải nén, vui lòng chờ...</div>';
 
             try {
-                const response = await fetch('/api/upload', { method: 'POST', body: formData });
+                const response = await fetch('/api/upload', { 
+                    method: 'POST', 
+                    body: formData 
+                });
+                
                 const data = await response.json();
+
+                if (!response.ok) {
+                    throw new Error(data.error || 'Upload failed');
+                }
 
                 const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
                 document.getElementById('extractTime').textContent = elapsed;
 
                 if (data.success) {
-                    extractedFiles = data.files;
-                    currentWorkspaceId = data.workspace_id;
-
+                    // CẬP NHẬT DANH SÁCH FILE TỪ SERVER
+                    extractedFiles = data.files || [];
+                    
                     document.getElementById('statsRow').style.display = 'flex';
                     document.getElementById('controlsRow').style.display = 'flex';
-                    document.getElementById('totalFiles').textContent = data.count;
-                    document.getElementById('totalSize').textContent = data.total_size_formatted;
-                    document.getElementById('workspaceSize').textContent = data.workspace_total || data.total_size_formatted;
+                    document.getElementById('totalFiles').textContent = extractedFiles.length;
+                    document.getElementById('totalSize').textContent = data.total_size_formatted || formatSize(data.total_size);
+                    document.getElementById('workspaceSize').textContent = data.total_size_formatted || formatSize(data.total_size);
 
                     renderFileList();
                     showProgress(false);
-                    showToast(`✅ Thành công! ${data.count} file (${data.total_size_formatted}) - ${elapsed}s`, 'success');
+                    showToast(`✅ Thành công! ${extractedFiles.length} file (${data.total_size_formatted}) - ${elapsed}s`, 'success');
                 } else {
-                    showProgress(false);
-                    showToast(`❌ Lỗi: ${data.error}`, 'error');
+                    throw new Error(data.error || 'Unknown error');
                 }
             } catch (err) {
+                console.error('Upload error:', err);
                 showProgress(false);
-                showToast(`❌ Lỗi kết nối: ${err.message}`, 'error');
+                showToast(`❌ Lỗi: ${err.message}`, 'error');
             }
             document.getElementById('queueStatus').innerHTML = '';
         }
@@ -712,7 +736,7 @@ HTML_TEMPLATE = """
             const searchTerm = document.getElementById('searchInput').value.toLowerCase();
             let filtered = searchTerm ? extractedFiles.filter(f => f.name.toLowerCase().includes(searchTerm)) : extractedFiles;
 
-            if (filtered.length === 0) {
+            if (!filtered || filtered.length === 0) {
                 document.getElementById('fileList').innerHTML = '<div class="text-center text-muted py-5"><i class="fas fa-folder-open fa-3x mb-3"></i><br>Chưa có file nào. Hãy kéo thả file nén vào bên trên.</div>';
                 return;
             }
@@ -741,37 +765,45 @@ HTML_TEMPLATE = """
         }
 
         function formatSize(bytes) {
-            if (bytes === 0) return '0 B';
+            if (!bytes || bytes === 0) return '0 B';
             const units = ['B', 'KB', 'MB', 'GB'];
             let i = 0;
-            while (bytes >= 1024 && i < units.length - 1) {
-                bytes /= 1024;
+            let size = bytes;
+            while (size >= 1024 && i < units.length - 1) {
+                size /= 1024;
                 i++;
             }
-            return bytes.toFixed(1) + ' ' + units[i];
+            return size.toFixed(1) + ' ' + units[i];
         }
 
         function escapeHtml(str) {
+            if (!str) return '';
             return str.replace(/[&<>]/g, m => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[m]));
         }
 
         window.downloadFile = function(filename) {
+            if (!filename) return;
             window.open(`/api/download/${filename}`, '_blank');
             showToast(`📥 Đang tải ${filename}`, 'info');
         };
 
         window.deleteFile = async function(filename) {
+            if (!filename) return;
             if (confirm(`Xóa file "${filename}"?`)) {
-                await fetch(`/api/delete-file/${encodeURIComponent(filename)}`, { method: 'DELETE' });
-                extractedFiles = extractedFiles.filter(f => f.name !== filename);
-                renderFileList();
-                document.getElementById('totalFiles').textContent = extractedFiles.length;
-                showToast('Đã xóa', 'info');
+                const res = await fetch(`/api/delete-file/${encodeURIComponent(filename)}`, { method: 'DELETE' });
+                if (res.ok) {
+                    extractedFiles = extractedFiles.filter(f => f.name !== filename);
+                    renderFileList();
+                    document.getElementById('totalFiles').textContent = extractedFiles.length;
+                    showToast('Đã xóa', 'info');
+                } else {
+                    showToast('Xóa thất bại', 'error');
+                }
             }
         };
 
         document.getElementById('downloadAllBtn').onclick = () => {
-            if (extractedFiles.length) {
+            if (extractedFiles && extractedFiles.length) {
                 window.open('/api/download-all', '_blank');
                 showToast(`📦 Đang tải ${extractedFiles.length} file...`, 'info');
             } else {
@@ -780,13 +812,17 @@ HTML_TEMPLATE = """
         };
 
         document.getElementById('clearAllBtn').onclick = async () => {
-            if (extractedFiles.length && confirm('Xóa TẤT CẢ file trong workspace?')) {
-                await fetch('/api/clear', { method: 'DELETE' });
-                extractedFiles = [];
-                renderFileList();
-                document.getElementById('statsRow').style.display = 'none';
-                document.getElementById('controlsRow').style.display = 'none';
-                showToast('Đã xóa toàn bộ workspace', 'success');
+            if (extractedFiles && extractedFiles.length && confirm('Xóa TẤT CẢ file trong workspace?')) {
+                const res = await fetch('/api/clear', { method: 'DELETE' });
+                if (res.ok) {
+                    extractedFiles = [];
+                    renderFileList();
+                    document.getElementById('statsRow').style.display = 'none';
+                    document.getElementById('controlsRow').style.display = 'none';
+                    showToast('Đã xóa toàn bộ workspace', 'success');
+                } else {
+                    showToast('Xóa thất bại', 'error');
+                }
             }
         };
 
@@ -796,21 +832,35 @@ HTML_TEMPLATE = """
         const uploadArea = document.getElementById('uploadArea');
         const fileInput = document.getElementById('fileInput');
 
-        uploadArea.addEventListener('dragover', e => { e.preventDefault(); uploadArea.classList.add('drag-over'); });
-        uploadArea.addEventListener('dragleave', () => uploadArea.classList.remove('drag-over'));
+        uploadArea.addEventListener('dragover', e => { 
+            e.preventDefault(); 
+            uploadArea.classList.add('drag-over'); 
+        });
+        
+        uploadArea.addEventListener('dragleave', () => { 
+            uploadArea.classList.remove('drag-over'); 
+        });
+        
         uploadArea.addEventListener('drop', e => {
             e.preventDefault();
             uploadArea.classList.remove('drag-over');
             const file = e.dataTransfer.files[0];
-            if (file) uploadFile(file);
-            else showToast('Vui lòng kéo thả file nén', 'warning');
+            if (file) {
+                uploadFile(file);
+            } else {
+                showToast('Vui lòng kéo thả file nén', 'warning');
+            }
         });
+        
         uploadArea.addEventListener('click', () => fileInput.click());
         fileInput.addEventListener('change', e => {
-            if (e.target.files[0]) uploadFile(e.target.files[0]);
+            if (e.target.files && e.target.files[0]) {
+                uploadFile(e.target.files[0]);
+            }
             fileInput.value = '';
         });
 
+        // Khởi tạo
         getWorkspace();
         showToast('🚀 Web Unzip Pro sẵn sàng! Kéo thả file ZIP/TAR/GZ vào đây.', 'success');
     </script>
