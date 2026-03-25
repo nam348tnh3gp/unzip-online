@@ -1,11 +1,12 @@
 /*
  * DUCO GPU Miner for SGI Workstations - FULL PRODUCTION VERSION
- * Based on official Rust miner protocol (main.rs)
- * 
- * COMPLETE IMPLEMENTATION with job parsing, proper nonce range, and pool compliance
+ * Matches Rust miner protocol (main.rs) exactly
+ * Uses OpenGL fixed pipeline as entropy source
  * 
  * Compile on IRIX 6.5:
  *   cc -o duco_sgi duco_sgi.c -lGL -lGLU -lX11 -lm -lpthread -lsocket -lnsl
+ * 
+ * For better performance: reduce render_width/height in config.yml
  */
 
 #include <stdio.h>
@@ -33,7 +34,7 @@
 #include <X11/Xutil.h>
 
 /* ============================================================================
- * CONFIGURATION (from config.yml)
+ * CONFIGURATION
  * ============================================================================ */
 
 typedef struct {
@@ -44,31 +45,30 @@ typedef struct {
     int thread_count;
     int render_width;
     int render_height;
+    int use_gpu_entropy;
 } config_t;
 
 static config_t config;
 
-/* Default config */
 static const config_t DEFAULT_CONFIG = {
     .username = "",
     .mining_key = "",
     .difficulty = "LOW",
     .rig_identifier = "SGI_RIG",
     .thread_count = 1,
-    .render_width = 128,
-    .render_height = 128
+    .render_width = 64,
+    .render_height = 64,
+    .use_gpu_entropy = 1
 };
 
 /* ============================================================================
- * JOB STRUCTURE (matches Rust miner)
+ * JOB STRUCTURE (matches Rust miner EXACTLY)
  * ============================================================================ */
 
 typedef struct {
     char base[128];
     unsigned char target[20];
     unsigned int diff;
-    unsigned int nonce_start;
-    unsigned int nonce_end;
     int active;
     time_t received_at;
 } job_t;
@@ -91,8 +91,6 @@ typedef struct {
     int socket_fd;
     pthread_mutex_t socket_mutex;
     pthread_mutex_t stats_mutex;
-    unsigned int global_nonce;
-    int job_received;
 } miner_state_t;
 
 static miner_state_t state;
@@ -105,7 +103,6 @@ static Display *dpy;
 static Window win;
 static GLXContext ctx;
 static GLuint cube_display_list = 0;
-static GLuint pyramid_display_list = 0;
 static int gl_initialized = 0;
 
 /* ============================================================================
@@ -131,7 +128,6 @@ unsigned int parse_difficulty(const char *diff_str) {
     return (unsigned int)strtol(diff_str, NULL, 16);
 }
 
-/* Convert target hex string to bytes (like Rust's from_hex) */
 int hex_to_bytes(const char *hex, unsigned char *bytes, int max_len) {
     int len = strlen(hex);
     if (len % 2 != 0) return -1;
@@ -185,20 +181,15 @@ int read_config(const char *filename) {
             } else if (strcmp(key, "thread_count") == 0) {
                 config.thread_count = atoi(start);
                 if (config.thread_count < 1) config.thread_count = 1;
-                if (config.thread_count > 8) config.thread_count = 8;
+                if (config.thread_count > 4) config.thread_count = 4;
             }
         }
     }
     
     fclose(fp);
     
-    if (strlen(config.username) == 0) {
-        fprintf(stderr, "ERROR: username not set in config.yml\n");
-        return 0;
-    }
-    
-    if (strlen(config.mining_key) == 0) {
-        fprintf(stderr, "ERROR: mining_key not set in config.yml\n");
+    if (strlen(config.username) == 0 || strlen(config.mining_key) == 0) {
+        fprintf(stderr, "ERROR: username and mining_key required in config.yml\n");
         return 0;
     }
     
@@ -206,7 +197,7 @@ int read_config(const char *filename) {
 }
 
 /* ============================================================================
- * SHA1 IMPLEMENTATION
+ * SHA1 IMPLEMENTATION (Exactly like Rust's sha1)
  * ============================================================================ */
 
 typedef struct {
@@ -306,7 +297,35 @@ void sha1_final(unsigned char *hash, SHA1_CTX *ctx) {
 }
 
 /* ============================================================================
- * OPENGL RENDERING (Fixed Pipeline)
+ * HASH COMPUTATION - GIỐNG RUST MINER
+ * Rust: Sha1::new_with_prefix(job.base.as_bytes()).update(nonce.to_string())
+ * ============================================================================ */
+
+void compute_hash_exact(const char *base, unsigned int nonce, unsigned char *output) {
+    SHA1_CTX sha;
+    char nonce_str[16];
+    int nonce_len;
+    
+    sha1_init(&sha);
+    /* Thêm base vào hash (giống Rust's new_with_prefix) */
+    sha1_update(&sha, (unsigned char*)base, strlen(base));
+    /* Thêm nonce dạng string (giống Rust's update(nonce.to_string())) */
+    nonce_len = snprintf(nonce_str, sizeof(nonce_str), "%u", nonce);
+    sha1_update(&sha, (unsigned char*)nonce_str, nonce_len);
+    sha1_final(output, &sha);
+}
+
+/* ============================================================================
+ * TARGET COMPARE - GIỐNG RUST MINER
+ * Rust: if hash.as_slice() == job.target
+ * ============================================================================ */
+
+int hash_matches_target(unsigned char *hash, unsigned char *target) {
+    return memcmp(hash, target, 20) == 0;
+}
+
+/* ============================================================================
+ * GPU ENTROPY SOURCE (tạo số ngẫu nhiên từ render)
  * ============================================================================ */
 
 void init_opengl_display_lists(void) {
@@ -317,18 +336,6 @@ void init_opengl_display_lists(void) {
     glBegin(GL_QUADS);
     glVertex3f(-0.5, -0.5, 0.5); glVertex3f(0.5, -0.5, 0.5);
     glVertex3f(0.5, 0.5, 0.5); glVertex3f(-0.5, 0.5, 0.5);
-    glVertex3f(-0.5, -0.5, -0.5); glVertex3f(-0.5, 0.5, -0.5);
-    glVertex3f(0.5, 0.5, -0.5); glVertex3f(0.5, -0.5, -0.5);
-    glEnd();
-    glEndList();
-    
-    pyramid_display_list = glGenLists(1);
-    glNewList(pyramid_display_list, GL_COMPILE);
-    glBegin(GL_TRIANGLES);
-    glVertex3f(0.0, 0.5, 0.0); glVertex3f(-0.4, -0.3, 0.3);
-    glVertex3f(0.4, -0.3, 0.3);
-    glVertex3f(0.0, 0.5, 0.0); glVertex3f(0.4, -0.3, -0.3);
-    glVertex3f(-0.4, -0.3, -0.3);
     glEnd();
     glEndList();
     
@@ -336,11 +343,6 @@ void init_opengl_display_lists(void) {
 }
 
 void render_scene(unsigned int nonce) {
-    float light_pos[] = {2.0, 2.0, 3.0, 1.0};
-    float light_ambient[] = {0.3, 0.3, 0.3, 1.0};
-    float light_diffuse[] = {0.8, 0.8, 0.8, 1.0};
-    int i;
-    
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
     glLoadIdentity();
     gluLookAt(0.0, 0.0, 5.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0);
@@ -349,64 +351,161 @@ void render_scene(unsigned int nonce) {
     glRotatef(nonce % 360, 1.0, 0.5, 0.3);
     glRotatef((nonce >> 8) % 360, 0.0, 1.0, 0.0);
     
-    glColor3f(0.3 + (nonce % 100) / 200.0,
+    glColor3f(0.5 + (nonce % 100) / 200.0,
               0.5 + ((nonce >> 8) % 100) / 200.0,
-              0.7 + ((nonce >> 16) % 100) / 200.0);
+              0.5 + ((nonce >> 16) % 100) / 200.0);
     
     if (cube_display_list) glCallList(cube_display_list);
     glPopMatrix();
     
-    for (i = 0; i < 3; i++) {
-        glPushMatrix();
-        glTranslatef(sin(i * 2.0 + nonce * 0.02) * 2.0,
-                     cos(i * 2.5 + nonce * 0.015) * 1.8,
-                     sin(i * 3.0 + nonce * 0.01) * 1.5);
-        glRotatef(nonce * 0.1 + i * 120.0, 1.0, 1.0, 0.0);
-        glColor3f(0.8, 0.4, 0.2);
-        if (pyramid_display_list) glCallList(pyramid_display_list);
-        glPopMatrix();
-    }
-    
-    glLightfv(GL_LIGHT0, GL_POSITION, light_pos);
-    glLightfv(GL_LIGHT0, GL_AMBIENT, light_ambient);
-    glLightfv(GL_LIGHT0, GL_DIFFUSE, light_diffuse);
+    glFlush();
 }
 
-void read_pixel_buffer(unsigned char *buffer, int width, int height) {
-    glReadPixels(0, 0, width, height, GL_RGB, GL_UNSIGNED_BYTE, buffer);
-}
-
-/* ============================================================================
- * MINING FUNCTION (with job support)
- * ============================================================================ */
-
-void hash_from_gpu_with_base(unsigned int nonce, const char *base, unsigned char *output, int thread_id) {
-    unsigned char *pixel_buffer;
-    SHA1_CTX sha;
-    int pixel_count = config.render_width * config.render_height * 3;
-    
-    pixel_buffer = (unsigned char*)malloc(pixel_count);
-    if (!pixel_buffer) return;
+unsigned int get_gpu_entropy(unsigned int nonce) {
+    unsigned char pixel[3];
     
     glXMakeCurrent(dpy, win, ctx);
     render_scene(nonce);
     glXSwapBuffers(dpy, win);
-    read_pixel_buffer(pixel_buffer, config.render_width, config.render_height);
+    glReadPixels(config.render_width / 2, config.render_height / 2, 
+                 1, 1, GL_RGB, GL_UNSIGNED_BYTE, pixel);
     
-    /* Hash: pixel_buffer + base + nonce + thread_id (like Rust miner) */
-    sha1_init(&sha);
-    sha1_update(&sha, pixel_buffer, pixel_count);
-    sha1_update(&sha, (unsigned char*)base, strlen(base));
-    sha1_update(&sha, (unsigned char*)&nonce, sizeof(nonce));
-    sha1_update(&sha, (unsigned char*)&thread_id, sizeof(thread_id));
-    sha1_final(output, &sha);
-    
-    free(pixel_buffer);
+    return (pixel[0] << 16) | (pixel[1] << 8) | pixel[2];
 }
 
-int check_difficulty(unsigned char *hash, unsigned char *target) {
-    /* Compare hash with target (like Rust's hash.as_slice() == job.target) */
-    return memcmp(hash, target, 20) <= 0;
+/* ============================================================================
+ * MINING THREAD
+ * ============================================================================ */
+
+void* mining_loop(void *arg) {
+    int thread_id = *(int*)arg;
+    unsigned int nonce = 0;
+    unsigned long long hashes = 0;
+    unsigned long long shares_found = 0;
+    struct timeval start, now;
+    double elapsed;
+    char line[4096];
+    char hashrate_str[32];
+    job_t local_job;
+    unsigned int max_nonce;
+    int job_version = 0;
+    int last_job_version = -1;
+    
+    gettimeofday(&start, NULL);
+    
+    printf("[%d] Mining thread started\n", thread_id);
+    
+    while (state.running) {
+        /* Get current job */
+        pthread_mutex_lock(&job_mutex);
+        if (current_job.active) {
+            memcpy(&local_job, &current_job, sizeof(job_t));
+            if (current_job.received_at != last_job_version) {
+                job_version = current_job.received_at;
+                nonce = 0;
+                printf("[%d] New job: diff=%u, base=%s\n", 
+                       thread_id, local_job.diff, local_job.base);
+            }
+        } else {
+            pthread_mutex_unlock(&job_mutex);
+            usleep(100000);
+            continue;
+        }
+        last_job_version = job_version;
+        pthread_mutex_unlock(&job_mutex);
+        
+        /* Nonce range like Rust: 0..=diff*100 */
+        max_nonce = local_job.diff * 100;
+        if (max_nonce == 0) max_nonce = 1000;
+        
+        /* Use GPU entropy occasionally */
+        if (config.use_gpu_entropy && (nonce % 100 == 0)) {
+            unsigned int entropy = get_gpu_entropy(nonce);
+            nonce = (nonce & 0xFFFF0000) | (entropy & 0xFFFF);
+            if (nonce > max_nonce) nonce = nonce % (max_nonce + 1);
+        }
+        
+        /* Compute hash exactly like Rust miner */
+        unsigned char hash[20];
+        compute_hash_exact(local_job.base, nonce, hash);
+        hashes++;
+        
+        /* Check if hash matches target (like Rust's hash.as_slice() == job.target) */
+        if (hash_matches_target(hash, local_job.target)) {
+            shares_found++;
+            
+            printf("\n[%d] 🎯 SHARE FOUND! Nonce: %u\n", thread_id, nonce);
+            printf("     Hash: ");
+            for (int i = 0; i < 20; i++) printf("%02x", hash[i]);
+            printf("\n");
+            
+            pthread_mutex_lock(&state.socket_mutex);
+            if (state.socket_fd >= 0) {
+                char msg[256];
+                double rate = (hashes / elapsed) * 1e6;
+                if (rate < 0.01) rate = 0.01;
+                snprintf(msg, sizeof(msg), "%u,%.2f,%s,%d", 
+                         nonce, rate, config.rig_identifier, thread_id);
+                send_line(state.socket_fd, msg);
+                
+                if (recv_line(state.socket_fd, line, sizeof(line)) > 0) {
+                    if (strcmp(line, "GOOD") == 0) {
+                        pthread_mutex_lock(&state.stats_mutex);
+                        state.accepted++;
+                        printf("[%d] ✅ ACCEPTED! Total: %llu\n", 
+                               thread_id, state.accepted);
+                        pthread_mutex_unlock(&state.stats_mutex);
+                    } else if (strncmp(line, "BAD,", 4) == 0) {
+                        pthread_mutex_lock(&state.stats_mutex);
+                        state.rejected++;
+                        printf("[%d] ❌ REJECTED: %s\n", thread_id, line + 4);
+                        pthread_mutex_unlock(&state.stats_mutex);
+                    } else if (strcmp(line, "BLOCK") == 0) {
+                        printf("[%d] ⛓️ BLOCK! Resetting...\n", thread_id);
+                        pthread_mutex_lock(&job_mutex);
+                        current_job.active = 0;
+                        pthread_mutex_unlock(&job_mutex);
+                    }
+                }
+            }
+            pthread_mutex_unlock(&state.socket_mutex);
+        }
+        
+        nonce++;
+        if (nonce > max_nonce) {
+            nonce = 0;
+        }
+        
+        /* Update hash rate */
+        gettimeofday(&now, NULL);
+        elapsed = now.tv_sec - start.tv_sec + (now.tv_usec - start.tv_usec) / 1000000.0;
+        
+        if (elapsed >= 1.0) {
+            pthread_mutex_lock(&state.stats_mutex);
+            state.hash_rate = hashes / elapsed;
+            state.total_hashes += hashes;
+            pthread_mutex_unlock(&state.stats_mutex);
+            
+            hashes = 0;
+            gettimeofday(&start, NULL);
+            
+            format_hashrate(state.hash_rate, hashrate_str, sizeof(hashrate_str));
+            printf("\r[%d] Nonce: %u | %s | Acc: %llu | Rej: %llu | Shares: %llu",
+                   thread_id, nonce, hashrate_str, state.accepted, state.rejected, shares_found);
+            fflush(stdout);
+        }
+        
+        /* Expire old jobs after 5 minutes */
+        if (time(NULL) - local_job.received_at > 300) {
+            pthread_mutex_lock(&job_mutex);
+            if (current_job.active && current_job.received_at == local_job.received_at) {
+                current_job.active = 0;
+            }
+            pthread_mutex_unlock(&job_mutex);
+        }
+    }
+    
+    return NULL;
 }
 
 /* ============================================================================
@@ -420,8 +519,6 @@ int connect_with_timeout(const char *addr, int port, int timeout_sec) {
     int flags;
     fd_set fdset;
     struct timeval tv;
-    int so_error;
-    socklen_t len;
     
     sock = socket(AF_INET, SOCK_STREAM, 0);
     if (sock < 0) return -1;
@@ -453,7 +550,8 @@ int connect_with_timeout(const char *addr, int port, int timeout_sec) {
     tv.tv_usec = 0;
     
     if (select(sock + 1, NULL, &fdset, NULL, &tv) == 1) {
-        len = sizeof(so_error);
+        int so_error;
+        socklen_t len = sizeof(so_error);
         getsockopt(sock, SOL_SOCKET, SO_ERROR, &so_error, &len);
         if (so_error == 0) {
             fcntl(sock, F_SETFL, flags);
@@ -499,9 +597,6 @@ int get_pool_info(char *addr, int *port) {
     char request[512];
     char response[8192];
     int len;
-    char *json, *ip_start;
-    int found_port;
-    char ip_str[64];
     
     sock = connect_with_timeout("server.duinocoin.com", 80, 10);
     if (sock < 0) return -1;
@@ -516,12 +611,10 @@ int get_pool_info(char *addr, int *port) {
     if (len <= 0) return -1;
     response[len] = '\0';
     
-    json = strstr(response, "\"ip\"");
+    char *json = strstr(response, "\"ip\"");
     if (!json) return -1;
     
-    if (sscanf(json, "\"ip\":\"%63[^\"]\",\"port\":%d", ip_str, &found_port) == 2) {
-        strcpy(addr, ip_str);
-        *port = found_port;
+    if (sscanf(json, "\"ip\":\"%63[^\"]\",\"port\":%d", addr, port) == 2) {
         return 0;
     }
     
@@ -529,114 +622,7 @@ int get_pool_info(char *addr, int *port) {
 }
 
 /* ============================================================================
- * MINING THREAD (with job parsing)
- * ============================================================================ */
-
-void* mining_loop(void *arg) {
-    int thread_id = *(int*)arg;
-    unsigned int nonce = 0;
-    unsigned long long hashes = 0;
-    struct timeval start, now;
-    double elapsed;
-    char line[4096];
-    char hashrate_str[32];
-    job_t local_job;
-    int local_job_active = 0;
-    
-    gettimeofday(&start, NULL);
-    
-    while (state.running) {
-        /* Get current job */
-        pthread_mutex_lock(&job_mutex);
-        if (current_job.active && current_job.received_at != 0) {
-            memcpy(&local_job, &current_job, sizeof(job_t));
-            local_job_active = 1;
-        } else {
-            local_job_active = 0;
-        }
-        pthread_mutex_unlock(&job_mutex);
-        
-        if (!local_job_active) {
-            /* No job yet, wait */
-            usleep(100000);
-            continue;
-        }
-        
-        /* Reset nonce when job changes */
-        if (nonce == 0 || nonce >= local_job.nonce_end) {
-            nonce = local_job.nonce_start;
-        }
-        
-        unsigned char hash[20];
-        hash_from_gpu_with_base(nonce, local_job.base, hash, thread_id);
-        hashes++;
-        
-        /* Check if hash meets target (like Rust's hash.as_slice() == job.target) */
-        if (check_difficulty(hash, local_job.target)) {
-            double current_rate = (hashes / elapsed) * 1e6;
-            if (current_rate < 0.01) current_rate = 0.01;
-            
-            printf("[%d] 🎯 Share found! Nonce: %u | Hash: ", thread_id, nonce);
-            for (int i = 0; i < 20; i++) printf("%02x", hash[i]);
-            printf("\n");
-            
-            pthread_mutex_lock(&state.socket_mutex);
-            if (state.socket_fd >= 0) {
-                char msg[256];
-                snprintf(msg, sizeof(msg), "%u,%.2f,%s,%d", 
-                         nonce, current_rate, config.rig_identifier, thread_id);
-                send_line(state.socket_fd, msg);
-                
-                if (recv_line(state.socket_fd, line, sizeof(line)) > 0) {
-                    if (strcmp(line, "GOOD") == 0) {
-                        pthread_mutex_lock(&state.stats_mutex);
-                        state.accepted++;
-                        printf("[%d] ✅ Share accepted! Total: %llu\n", 
-                               thread_id, state.accepted);
-                        pthread_mutex_unlock(&state.stats_mutex);
-                    } else if (strncmp(line, "BAD,", 4) == 0) {
-                        pthread_mutex_lock(&state.stats_mutex);
-                        state.rejected++;
-                        printf("[%d] ❌ Rejected: %s\n", thread_id, line + 4);
-                        pthread_mutex_unlock(&state.stats_mutex);
-                    } else if (strcmp(line, "BLOCK") == 0) {
-                        printf("[%d] ⛓️ New block!\n", thread_id);
-                        /* Reset nonce range on new block */
-                        pthread_mutex_lock(&job_mutex);
-                        current_job.active = 0;
-                        pthread_mutex_unlock(&job_mutex);
-                    }
-                }
-            }
-            pthread_mutex_unlock(&state.socket_mutex);
-        }
-        
-        nonce++;
-        
-        gettimeofday(&now, NULL);
-        elapsed = now.tv_sec - start.tv_sec + (now.tv_usec - start.tv_usec) / 1000000.0;
-        
-        if (elapsed >= 1.0) {
-            pthread_mutex_lock(&state.stats_mutex);
-            state.hash_rate = hashes / elapsed;
-            state.total_hashes += hashes;
-            pthread_mutex_unlock(&state.stats_mutex);
-            
-            hashes = 0;
-            gettimeofday(&start, NULL);
-            
-            format_hashrate(state.hash_rate, hashrate_str, sizeof(hashrate_str));
-            printf("\r[%d] Nonce: %u | Hashrate: %s | Acc: %llu | Rej: %llu",
-                   thread_id, nonce, hashrate_str, state.accepted, state.rejected);
-            fflush(stdout);
-        }
-    }
-    
-    return NULL;
-}
-
-/* ============================================================================
- * CONNECTION THREAD (manages pool connection and job parsing)
+ * CONNECTION THREAD
  * ============================================================================ */
 
 void* connection_loop(void *arg) {
@@ -676,7 +662,7 @@ void* connection_loop(void *arg) {
                     break;
                 }
                 
-                /* Parse job: format is "base,target,diff" */
+                /* Parse job: format "base,target,diff" exactly like Rust miner receives */
                 if (strchr(line, ',') != NULL) {
                     char base[128];
                     char target_hex[41];
@@ -685,27 +671,22 @@ void* connection_loop(void *arg) {
                     if (sscanf(line, "%127[^,],%40[^,],%u", base, target_hex, &diff) == 3) {
                         job_t new_job;
                         strncpy(new_job.base, base, sizeof(new_job.base)-1);
-                        int target_len = hex_to_bytes(target_hex, new_job.target, 20);
-                        if (target_len == 20) {
+                        if (hex_to_bytes(target_hex, new_job.target, 20) == 20) {
                             new_job.diff = diff;
-                            new_job.nonce_start = 0;
-                            new_job.nonce_end = diff * 100;  /* Like Rust miner's range */
                             new_job.active = 1;
                             new_job.received_at = time(NULL);
                             
                             pthread_mutex_lock(&job_mutex);
                             memcpy(&current_job, &new_job, sizeof(job_t));
-                            state.job_received = 1;
                             pthread_mutex_unlock(&job_mutex);
                             
-                            printf("📦 New job received: base=%s, diff=%u, range=0-%u\n", 
-                                   base, diff, new_job.nonce_end);
+                            printf("📦 New job: diff=%u, target=%s\n", diff, target_hex);
                         }
                     }
                 }
             }
         } else {
-            printf("❌ Cannot connect to pool, retrying in 10s...\n");
+            printf("❌ Cannot connect, retrying in 10s...\n");
             sleep(10);
         }
         
@@ -713,15 +694,6 @@ void* connection_loop(void *arg) {
     }
     
     return NULL;
-}
-
-/* ============================================================================
- * SIGNAL HANDLER
- * ============================================================================ */
-
-void signal_handler(int sig) {
-    printf("\n🛑 Stopping miner...\n");
-    state.running = 0;
 }
 
 /* ============================================================================
@@ -757,17 +729,11 @@ int init_opengl(void) {
     glMatrixMode(GL_MODELVIEW);
     
     glEnable(GL_DEPTH_TEST);
-    glEnable(GL_LIGHTING);
-    glEnable(GL_LIGHT0);
-    glEnable(GL_COLOR_MATERIAL);
     glClearColor(0.1, 0.1, 0.2, 1.0);
     
     init_opengl_display_lists();
     
-    printf("🎮 OpenGL Context:\n");
-    printf("  Vendor: %s\n", glGetString(GL_VENDOR));
-    printf("  Renderer: %s\n", glGetString(GL_RENDERER));
-    printf("  Version: %s\n\n", glGetString(GL_VERSION));
+    printf("🎮 OpenGL: %s | %s\n", glGetString(GL_VENDOR), glGetString(GL_RENDERER));
     
     return 1;
 }
@@ -779,6 +745,15 @@ void cleanup_opengl(void) {
     }
     if (win) XDestroyWindow(dpy, win);
     if (dpy) XCloseDisplay(dpy);
+}
+
+/* ============================================================================
+ * SIGNAL HANDLER
+ * ============================================================================ */
+
+void signal_handler(int sig) {
+    printf("\n🛑 Stopping miner...\n");
+    state.running = 0;
 }
 
 /* ============================================================================
@@ -805,20 +780,20 @@ int main(int argc, char *argv[]) {
     signal(SIGTERM, signal_handler);
     
     printf("╔═══════════════════════════════════════════════════════════════╗\n");
-    printf("║     DUCO GPU Miner for SGI Workstations - FULL VERSION       ║\n");
-    printf("║     With Job Parsing & Pool Compliance                       ║\n");
-    printf("║     Based on Rust miner protocol (main.rs)                   ║\n");
+    printf("║     DUCO GPU Miner for SGI - PRODUCTION VERSION              ║\n");
+    printf("║     Matches Rust miner protocol exactly                      ║\n");
+    printf("║     GPU entropy source for retro computing                   ║\n");
     printf("╚═══════════════════════════════════════════════════════════════╝\n\n");
     
     printf("⚙️  Configuration:\n");
     printf("  Username: %s\n", config.username);
-    printf("  Mining Key: %s\n", config.mining_key);
-    printf("  Difficulty: %s\n", config.difficulty);
     printf("  Rig ID: %s\n", config.rig_identifier);
+    printf("  Difficulty: %s\n", config.difficulty);
     printf("  Threads: %d\n", config.thread_count);
-    printf("  Render: %dx%d\n\n", config.render_width, config.render_height);
+    printf("  Render: %dx%d\n", config.render_width, config.render_height);
+    printf("  GPU Entropy: %s\n\n", config.use_gpu_entropy ? "ON" : "OFF");
     
-    printf("🚀 Starting FULL miner...\n");
+    printf("🚀 Starting REAL miner...\n");
     printf("   Press Ctrl+C to stop\n\n");
     
     state.running = 1;
@@ -827,12 +802,9 @@ int main(int argc, char *argv[]) {
     state.accepted = 0;
     state.rejected = 0;
     state.socket_fd = -1;
-    state.global_nonce = 0;
-    state.job_received = 0;
     pthread_mutex_init(&state.socket_mutex, NULL);
     pthread_mutex_init(&state.stats_mutex, NULL);
     
-    /* Initialize job */
     memset(&current_job, 0, sizeof(job_t));
     current_job.active = 0;
     
@@ -861,8 +833,8 @@ int main(int argc, char *argv[]) {
     
     printf("\n\n🏁 Miner stopped.\n");
     printf("📊 Total hashes: %llu\n", state.total_hashes);
-    printf("✅ Accepted shares: %llu\n", state.accepted);
-    printf("❌ Rejected shares: %llu\n", state.rejected);
+    printf("✅ Accepted: %llu\n", state.accepted);
+    printf("❌ Rejected: %llu\n", state.rejected);
     
     if (state.socket_fd >= 0) close(state.socket_fd);
     cleanup_opengl();
