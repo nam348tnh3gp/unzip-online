@@ -9,8 +9,10 @@ import time
 import uuid
 import threading
 import logging
+import mimetypes
+import base64
 from datetime import datetime
-from flask import Flask, request, jsonify, send_file, render_template_string, session
+from flask import Flask, request, jsonify, send_file, render_template_string, session, Response
 from flask_cors import CORS
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
@@ -29,10 +31,15 @@ class Config:
     MAX_WORKSPACE_SIZE = 5 * 1024 * 1024 * 1024  # 🔥 5GB extract
     MAX_FILES = 20000
     MAX_FILE_SIZE = 500 * 1024 * 1024  # 500MB/file
+    MAX_PREVIEW_SIZE = 10 * 1024 * 1024  # 10MB max for preview
     EXTRACT_TIMEOUT = 300
 
     RATE_LIMIT = "10 per minute"
     ALLOWED_EXTENSIONS = {'zip', 'tar', 'gz', 'tgz', 'bz2'}
+    
+    # Preview allowed extensions
+    TEXT_EXTENSIONS = {'txt', 'log', 'json', 'xml', 'html', 'htm', 'css', 'js', 'py', 'java', 'c', 'cpp', 'h', 'md', 'ini', 'cfg', 'conf', 'csv', 'tsv', 'yaml', 'yml', 'sh', 'bat', 'ps1'}
+    IMAGE_EXTENSIONS = {'jpg', 'jpeg', 'png', 'gif', 'bmp', 'webp', 'svg', 'ico'}
 
 os.makedirs(Config.UPLOAD_DIR, exist_ok=True)
 os.makedirs(Config.EXTRACT_DIR, exist_ok=True)
@@ -109,6 +116,18 @@ def format_size(size_bytes):
     return "{:.1f} {}".format(size_bytes, units[i])
 
 
+def get_file_type(filename):
+    """Detect file type for preview"""
+    ext = filename.split('.')[-1].lower() if '.' in filename else ''
+    
+    if ext in Config.TEXT_EXTENSIONS:
+        return 'text'
+    elif ext in Config.IMAGE_EXTENSIONS:
+        return 'image'
+    else:
+        return 'binary'
+
+
 # ==================== SECURITY ====================
 
 def safe_path(base, target):
@@ -154,7 +173,8 @@ def extract_zip(fp, out):
             files.append({
                 "name": m.filename,
                 "size": m.file_size,
-                "size_formatted": format_size(m.file_size)
+                "size_formatted": format_size(m.file_size),
+                "type": get_file_type(m.filename)
             })
 
     return files, total
@@ -197,7 +217,8 @@ def extract_tar(fp, out):
             files.append({
                 "name": m.name,
                 "size": m.size,
-                "size_formatted": format_size(m.size)
+                "size_formatted": format_size(m.size),
+                "type": get_file_type(m.name)
             })
 
     return files, total
@@ -321,6 +342,67 @@ def upload():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route('/api/preview/<path:name>')
+def preview_file(name):
+    """Preview file content (text or image)"""
+    ws = get_workspace()
+    file_path = os.path.join(ws["path"], name)
+
+    try:
+        safe_path(ws["path"], file_path)
+    except Exception:
+        return jsonify({"error": "Invalid file path"}), 403
+
+    if not os.path.exists(file_path):
+        return jsonify({"error": "File not found"}), 404
+
+    file_size = os.path.getsize(file_path)
+    file_type = get_file_type(name)
+    
+    if file_size > Config.MAX_PREVIEW_SIZE:
+        return jsonify({
+            "error": f"File too large for preview (max {format_size(Config.MAX_PREVIEW_SIZE)})",
+            "size": file_size,
+            "size_formatted": format_size(file_size)
+        }), 413
+    
+    try:
+        if file_type == 'text':
+            # Read text file
+            with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                content = f.read(500000)  # Limit to 500KB for display
+                return jsonify({
+                    "success": True,
+                    "type": "text",
+                    "name": name,
+                    "size": file_size,
+                    "size_formatted": format_size(file_size),
+                    "content": content
+                })
+        elif file_type == 'image':
+            # Return image as base64
+            with open(file_path, 'rb') as f:
+                img_data = base64.b64encode(f.read()).decode('utf-8')
+                mime_type = mimetypes.guess_type(name)[0] or 'image/jpeg'
+                return jsonify({
+                    "success": True,
+                    "type": "image",
+                    "name": name,
+                    "size": file_size,
+                    "size_formatted": format_size(file_size),
+                    "data": f"data:{mime_type};base64,{img_data}"
+                })
+        else:
+            return jsonify({
+                "success": False,
+                "error": "File type not previewable",
+                "type": "binary"
+            }), 400
+            
+    except Exception as e:
+        return jsonify({"error": f"Preview failed: {str(e)}"}), 500
+
+
 @app.route('/api/download/<path:name>')
 def download(name):
     ws = get_workspace()
@@ -410,7 +492,7 @@ HTML_TEMPLATE = """
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Web Unzip Pro - Giải nén file trực tuyến</title>
+    <title>Web Unzip Pro - Giải nén và xem file trực tuyến</title>
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
     <style>
@@ -421,7 +503,7 @@ HTML_TEMPLATE = """
             min-height: 100vh;
             padding: 20px;
         }
-        .container { max-width: 1400px; margin: 0 auto; }
+        .container { max-width: 1600px; margin: 0 auto; }
         .card {
             border-radius: 20px;
             box-shadow: 0 20px 60px rgba(0,0,0,0.3);
@@ -466,8 +548,8 @@ HTML_TEMPLATE = """
         .file-item {
             background: white;
             border-radius: 12px;
-            padding: 15px;
-            margin-bottom: 12px;
+            padding: 12px 15px;
+            margin-bottom: 10px;
             box-shadow: 0 2px 8px rgba(0,0,0,0.1);
             transition: all 0.2s;
             border-left: 4px solid #4361ee;
@@ -476,6 +558,10 @@ HTML_TEMPLATE = """
             transform: translateX(5px);
             box-shadow: 0 4px 12px rgba(0,0,0,0.15);
             border-left-color: #06ffa5;
+        }
+        .file-type-icon {
+            width: 32px;
+            text-align: center;
         }
         .toast-notification {
             position: fixed;
@@ -528,6 +614,40 @@ HTML_TEMPLATE = """
             transition: all 0.2s;
         }
         .btn-custom:hover { transform: scale(1.02); }
+        
+        /* Preview Modal */
+        .modal-preview {
+            max-width: 90vw;
+            width: auto;
+        }
+        .preview-content {
+            max-height: 70vh;
+            overflow: auto;
+            background: #1e1e2e;
+            color: #e0e0e0;
+            padding: 20px;
+            border-radius: 12px;
+            font-family: 'Monaco', monospace;
+            font-size: 13px;
+            white-space: pre-wrap;
+            word-break: break-all;
+        }
+        .preview-image {
+            max-width: 100%;
+            max-height: 60vh;
+            object-fit: contain;
+        }
+        .file-tag {
+            display: inline-block;
+            padding: 2px 8px;
+            border-radius: 12px;
+            font-size: 10px;
+            font-weight: bold;
+            margin-left: 8px;
+        }
+        .tag-text { background: #3b82f6; color: white; }
+        .tag-image { background: #10b981; color: white; }
+        .tag-binary { background: #6b7280; color: white; }
         footer {
             text-align: center;
             padding: 20px;
@@ -543,11 +663,11 @@ HTML_TEMPLATE = """
                 <div class="row align-items-center">
                     <div class="col-md-7">
                         <h2><i class="fas fa-file-archive me-2"></i> Web Unzip Pro</h2>
-                        <p class="mb-0 mt-1">Giải nén ZIP, TAR, GZ, BZ2 trực tuyến | Bảo mật | Hỗ trợ file lên đến 5GB</p>
+                        <p class="mb-0 mt-1">Giải nén và xem nội dung ZIP, TAR, GZ, BZ2 | Xem trực tiếp file text, ảnh</p>
                     </div>
                     <div class="col-md-5 text-end">
                         <span class="badge bg-success me-2"><i class="fas fa-check-circle"></i> Unlimited</span>
-                        <span class="badge bg-warning text-dark"><i class="fas fa-shield-alt"></i> Secure</span>
+                        <span class="badge bg-warning text-dark"><i class="fas fa-eye"></i> Preview</span>
                         <div class="mt-2 small">
                             <i class="fas fa-fingerprint me-1"></i> Workspace: <span class="session-id" id="sessionId">Loading...</span>
                         </div>
@@ -559,7 +679,7 @@ HTML_TEMPLATE = """
                 <div class="upload-area" id="uploadArea">
                     <i class="fas fa-cloud-upload-alt fa-4x mb-3" style="color: #4361ee;"></i>
                     <h4>Kéo thả file nén vào đây</h4>
-                    <p class="text-muted">Hỗ trợ ZIP, TAR, GZ, BZ2 | Tối đa 20,000 file | Mỗi file ≤ 500MB | Tổng ≤ 5GB</p>
+                    <p class="text-muted">Hỗ trợ ZIP, TAR, GZ, BZ2 | Xem nội dung file text và ảnh sau khi giải nén</p>
                     <input type="file" id="fileInput" accept=".zip,.tar,.gz,.tgz,.bz2,.tbz2" style="display: none;">
                     <button type="button" class="btn btn-primary mt-3" id="selectFileBtn">
                         <i class="fas fa-folder-open me-2"></i> Chọn file
@@ -627,12 +747,35 @@ HTML_TEMPLATE = """
             <i class="fas fa-lock"></i> Dữ liệu được xử lý trên server, tự động xóa sau 2 giờ
         </footer>
     </div>
+
+    <!-- Preview Modal -->
+    <div class="modal fade" id="previewModal" tabindex="-1">
+        <div class="modal-dialog modal-preview modal-lg">
+            <div class="modal-content" style="background: #2d2d44; color: white;">
+                <div class="modal-header border-secondary">
+                    <h5 class="modal-title" id="previewTitle">Xem file</h5>
+                    <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+                </div>
+                <div class="modal-body p-0" id="previewBody">
+                    <div class="text-center p-5">Đang tải...</div>
+                </div>
+                <div class="modal-footer border-secondary">
+                    <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Đóng</button>
+                    <button type="button" class="btn btn-primary" id="previewDownloadBtn">Tải xuống</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
     <div class="toast-notification" id="toast"></div>
 
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
     <script>
         let extractedFiles = [];
         let currentWorkspaceId = null;
         let startTime = null;
+        let previewModal = null;
+        let currentPreviewFile = null;
 
         // DOM elements
         const uploadArea = document.getElementById('uploadArea');
@@ -685,13 +828,66 @@ HTML_TEMPLATE = """
             }
         }
 
+        async function previewFile(filename) {
+            currentPreviewFile = filename;
+            const modal = new bootstrap.Modal(document.getElementById('previewModal'));
+            const previewBody = document.getElementById('previewBody');
+            const previewTitle = document.getElementById('previewTitle');
+            
+            previewTitle.innerHTML = `<i class="fas fa-eye me-2"></i>${filename}`;
+            previewBody.innerHTML = '<div class="text-center p-5"><i class="fas fa-spinner fa-spin fa-2x mb-3"></i><br>Đang tải...</div>';
+            modal.show();
+            
+            try {
+                const res = await fetch(`/api/preview/${encodeURIComponent(filename)}`);
+                const data = await res.json();
+                
+                if (data.success) {
+                    if (data.type === 'text') {
+                        previewBody.innerHTML = `
+                            <div class="preview-content">
+                                <div class="mb-2 text-muted small">
+                                    <i class="fas fa-file-alt me-1"></i> ${data.size_formatted} | UTF-8 Text
+                                </div>
+                                <pre style="margin:0; white-space:pre-wrap; word-break:break-all;">${escapeHtml(data.content)}</pre>
+                            </div>
+                        `;
+                    } else if (data.type === 'image') {
+                        previewBody.innerHTML = `
+                            <div class="text-center p-4">
+                                <div class="mb-2 text-muted small">${data.size_formatted}</div>
+                                <img src="${data.data}" class="preview-image" alt="${filename}">
+                            </div>
+                        `;
+                    }
+                } else {
+                    previewBody.innerHTML = `
+                        <div class="alert alert-danger m-4">
+                            <i class="fas fa-exclamation-triangle me-2"></i> ${data.error || 'Không thể xem file này'}
+                        </div>
+                    `;
+                }
+            } catch (err) {
+                previewBody.innerHTML = `
+                    <div class="alert alert-danger m-4">
+                        <i class="fas fa-exclamation-triangle me-2"></i> Lỗi: ${err.message}
+                    </div>
+                `;
+            }
+        }
+        
+        document.getElementById('previewDownloadBtn').addEventListener('click', () => {
+            if (currentPreviewFile) {
+                window.open(`/api/download/${encodeURIComponent(currentPreviewFile)}`, '_blank');
+            }
+        });
+
         async function uploadFile(file) {
             if (!file) {
                 showToast('Vui lòng chọn file', 'warning');
                 return;
             }
 
-            // Kiểm tra định dạng file
             const allowedExts = ['zip', 'tar', 'gz', 'tgz', 'bz2', 'tbz2'];
             const ext = file.name.split('.').pop().toLowerCase();
             if (!allowedExts.includes(ext)) {
@@ -708,29 +904,21 @@ HTML_TEMPLATE = """
             document.getElementById('queueStatus').innerHTML = '<div class="alert alert-info"><i class="fas fa-spinner fa-spin me-2"></i>Đang giải nén, vui lòng chờ...</div>';
 
             try {
-                const response = await fetch('/api/upload', { 
-                    method: 'POST', 
-                    body: formData 
-                });
-                
+                const response = await fetch('/api/upload', { method: 'POST', body: formData });
                 const data = await response.json();
 
-                if (!response.ok) {
-                    throw new Error(data.error || 'Upload failed');
-                }
+                if (!response.ok) throw new Error(data.error || 'Upload failed');
 
                 const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
                 document.getElementById('extractTime').textContent = elapsed;
 
                 if (data.success) {
                     extractedFiles = data.files || [];
-                    
                     document.getElementById('statsRow').style.display = 'flex';
                     document.getElementById('controlsRow').style.display = 'flex';
                     document.getElementById('totalFiles').textContent = extractedFiles.length;
                     document.getElementById('totalSize').textContent = data.total_size_formatted || formatSize(data.total_size);
                     document.getElementById('workspaceSize').textContent = data.total_size_formatted || formatSize(data.total_size);
-
                     renderFileList();
                     showProgress(false);
                     showToast(`✅ Thành công! ${extractedFiles.length} file (${data.total_size_formatted}) - ${elapsed}s`, 'success');
@@ -754,18 +942,39 @@ HTML_TEMPLATE = """
                 return;
             }
 
-            document.getElementById('fileList').innerHTML = filtered.map(file => `
+            document.getElementById('fileList').innerHTML = filtered.map(file => {
+                let icon = 'fa-file';
+                let tagClass = 'tag-binary';
+                let tagText = 'BIN';
+                
+                if (file.type === 'text') {
+                    icon = 'fa-file-alt';
+                    tagClass = 'tag-text';
+                    tagText = 'TXT';
+                } else if (file.type === 'image') {
+                    icon = 'fa-file-image';
+                    tagClass = 'tag-image';
+                    tagText = 'IMG';
+                }
+                
+                return `
                 <div class="file-item fade-in">
                     <div class="row align-items-center">
-                        <div class="col-auto">
-                            <i class="fas fa-${file.name.endsWith('.zip') ? 'file-archive' : 'file'} fa-2x text-primary"></i>
+                        <div class="col-auto file-type-icon">
+                            <i class="fas ${icon} fa-lg text-primary"></i>
                         </div>
                         <div class="col">
-                            <div class="fw-bold">${escapeHtml(file.name)}</div>
+                            <div class="fw-bold">
+                                ${escapeHtml(file.name)}
+                                <span class="file-tag ${tagClass}">${tagText}</span>
+                            </div>
                             <small class="text-muted">${file.size_formatted || formatSize(file.size)}</small>
                         </div>
                         <div class="col-auto">
-                            <button type="button" class="btn btn-sm btn-outline-primary me-2" onclick="downloadFile('${encodeURIComponent(file.name)}')" title="Tải xuống">
+                            <button type="button" class="btn btn-sm btn-outline-info me-1" onclick="previewFile('${encodeURIComponent(file.name)}')" title="Xem trước">
+                                <i class="fas fa-eye"></i>
+                            </button>
+                            <button type="button" class="btn btn-sm btn-outline-primary me-1" onclick="downloadFile('${encodeURIComponent(file.name)}')" title="Tải xuống">
                                 <i class="fas fa-download"></i>
                             </button>
                             <button type="button" class="btn btn-sm btn-outline-danger" onclick="deleteFile('${encodeURIComponent(file.name)}')" title="Xóa">
@@ -774,7 +983,7 @@ HTML_TEMPLATE = """
                         </div>
                     </div>
                 </div>
-            `).join('');
+            `}).join('');
         }
 
         function formatSize(bytes) {
